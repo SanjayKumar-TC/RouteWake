@@ -1,0 +1,6 @@
+{
+  "name": "RouteWake",
+  "description": "GPS travel alarm app with background arrival detection, persistent tracking service, and dark navigation cockpit.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

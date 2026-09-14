@@ -1,0 +1,14 @@
+<resources>
+    <string name="app_name">RouteWake</string>
+    <string name="permission_dialog_title">Permissions Required</string>
+    <string name="permission_dialog_desc">RouteWake needs precise location and notifications to track your journey in the background and sound your arrival alarm reliably.</string>
+    <string name="permission_location_title">Precise Location</string>
+    <string name="permission_location_desc">Continuous high-accuracy GPS for real-time distance tracking and geofenced arrival triggers.</string>
+    <string name="permission_notification_title">Arrival Notifications</string>
+    <string name="permission_notification_desc">Keeps background tracking active and presents loud wake-up alerts over the lock screen.</string>
+    <string name="permission_grant_button">Grant Permissions</string>
+    <string name="permission_settings_button">Open App Settings</string>
+    <string name="permission_dismiss_button">Not Now</string>
+    <string name="permission_banner_text">Location &amp; notification permissions are needed for arrival detection.</string>
+    <string name="permission_banner_action">Enable</string>
+</resources>
