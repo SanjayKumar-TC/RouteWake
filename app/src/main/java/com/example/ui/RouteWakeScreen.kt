@@ -3,6 +3,9 @@ package com.example.ui
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.animation.core.FastOutLinearInEasing
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -42,6 +45,8 @@ import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberMultiplePermissionsState
 import com.google.accompanist.permissions.rememberPermissionState
 import com.example.data.model.TripState
+import com.example.engine.LocationPrerequisiteManager
+import com.example.engine.LocationPrerequisiteState
 import com.example.ui.components.*
 import com.example.ui.map.MapContainer
 import com.example.ui.sheets.*
@@ -63,6 +68,7 @@ fun RouteWakeScreen(
     val routeInfo by viewModel.routeInfo.collectAsStateWithLifecycle()
     val metrics by viewModel.metrics.collectAsStateWithLifecycle()
     val currentLocation by viewModel.currentLocation.collectAsStateWithLifecycle()
+    val deviceHeading by viewModel.deviceHeading.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
 
     val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
@@ -74,11 +80,24 @@ fun RouteWakeScreen(
     val favorites by viewModel.favorites.collectAsStateWithLifecycle()
     val tripHistory by viewModel.tripHistory.collectAsStateWithLifecycle()
     val completedSummary by viewModel.completedTripSummary.collectAsStateWithLifecycle()
+    val prerequisiteState by viewModel.prerequisiteState.collectAsStateWithLifecycle()
 
     // Permissions Management via Google Accompanist Permissions library
     var permissionStatus by remember { mutableStateOf(checkPermissionStatus(context)) }
     var showPermissionDialog by remember { mutableStateOf(false) }
     var permissionDialogReason by remember { mutableStateOf(PermissionDialogReason.INITIAL) }
+
+    // Dialog & System Resolution control
+    var hasTriggeredSystemResolution by remember { mutableStateOf(false) }
+    var showLocationDisabledDialog by remember { mutableStateOf(false) }
+    var showHighAccuracyDialog by remember { mutableStateOf(false) }
+
+    // System Settings Resolution Launcher (for ResolvableApiException)
+    val locationSettingsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult()
+    ) { _ ->
+        viewModel.checkPrerequisites()
+    }
 
     val criticalPermissions = remember {
         buildList {
@@ -94,8 +113,9 @@ fun RouteWakeScreen(
         permissions = criticalPermissions
     ) { _ ->
         permissionStatus = checkPermissionStatus(context)
-        if (permissionStatus.hasFineLocation) {
+        if (permissionStatus.hasFineLocation || permissionStatus.hasCoarseLocation) {
             viewModel.refreshCurrentLocation()
+            viewModel.initiateFollowMode(forceRecenter = true)
         }
         if (permissionStatus.hasAllCritical) {
             showPermissionDialog = false
@@ -122,14 +142,63 @@ fun RouteWakeScreen(
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 permissionStatus = checkPermissionStatus(context)
-                if (permissionStatus.hasFineLocation) {
+                if (permissionStatus.hasFineLocation || permissionStatus.hasCoarseLocation) {
                     viewModel.refreshCurrentLocation()
                 }
+                viewModel.checkPrerequisites()
+                viewModel.startCompass()
+            } else if (event == Lifecycle.Event.ON_PAUSE) {
+                viewModel.stopCompass()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
+            viewModel.stopCompass()
             lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    // Automatically detect and launch native system resolution if needed, without endless loops
+    LaunchedEffect(prerequisiteState) {
+        when (val state = prerequisiteState) {
+            is LocationPrerequisiteState.Satisfied -> {
+                hasTriggeredSystemResolution = false
+                showLocationDisabledDialog = false
+                showHighAccuracyDialog = false
+                showPermissionDialog = false
+            }
+            is LocationPrerequisiteState.LocationDisabled -> {
+                if (state.resolvableException != null && !hasTriggeredSystemResolution) {
+                    hasTriggeredSystemResolution = true
+                    try {
+                        val request = IntentSenderRequest.Builder(state.resolvableException.resolution.intentSender).build()
+                        locationSettingsLauncher.launch(request)
+                    } catch (_: Exception) {
+                        showLocationDisabledDialog = true
+                    }
+                } else {
+                    showLocationDisabledDialog = true
+                }
+            }
+            is LocationPrerequisiteState.HighAccuracyDisabled -> {
+                if (state.resolvableException != null && !hasTriggeredSystemResolution) {
+                    hasTriggeredSystemResolution = true
+                    try {
+                        val request = IntentSenderRequest.Builder(state.resolvableException.resolution.intentSender).build()
+                        locationSettingsLauncher.launch(request)
+                    } catch (_: Exception) {
+                        showHighAccuracyDialog = true
+                    }
+                } else {
+                    showHighAccuracyDialog = true
+                }
+            }
+            is LocationPrerequisiteState.PermissionRequired -> {
+                if (!permissionStatus.hasFineLocation) {
+                    showPermissionDialog = true
+                }
+            }
+            LocationPrerequisiteState.Checking -> {}
         }
     }
 
@@ -154,17 +223,25 @@ fun RouteWakeScreen(
     LaunchedEffect(Unit) {
         val currentStatus = checkPermissionStatus(context)
         permissionStatus = currentStatus
+        if (currentStatus.hasFineLocation || currentStatus.hasCoarseLocation) {
+            viewModel.refreshCurrentLocation()
+            viewModel.initiateFollowMode(forceRecenter = true)
+        }
         if (!currentStatus.hasAllCritical) {
             locationAndNotifPermissionsState.launchMultiplePermissionRequest()
         } else {
-            viewModel.refreshCurrentLocation()
+            viewModel.checkPrerequisites()
         }
     }
 
-    var recenterTrigger by remember { mutableStateOf(0) }
+    val vmRecenterTrigger by viewModel.recenterTrigger.collectAsStateWithLifecycle()
+    var localRecenterTrigger by remember { mutableStateOf(0) }
+    val effectiveRecenterTrigger = vmRecenterTrigger + localRecenterTrigger
     var zoomInTrigger by remember { mutableStateOf(0) }
     var zoomOutTrigger by remember { mutableStateOf(0) }
     var fitRouteTrigger by remember { mutableStateOf(0) }
+    val isFollowMode by viewModel.isFollowMode.collectAsStateWithLifecycle()
+    val initialCameraState = remember { viewModel.getInitialCameraState() }
 
     Box(
         modifier = Modifier
@@ -180,11 +257,31 @@ fun RouteWakeScreen(
             showAlarmRadius = true,
             routePoints = routeInfo?.points ?: emptyList(),
             isSatellite = settings.satelliteMap,
-            recenterTrigger = recenterTrigger,
+            initialCameraState = initialCameraState,
+            isFollowMode = isFollowMode,
+            onManualNavigation = { lat, lng, zoom ->
+                viewModel.onManualMapNavigation(lat, lng, zoom)
+            },
+            onCameraChanged = { lat, lng, zoom ->
+                if (!isFollowMode) {
+                    viewModel.saveMapCameraState(lat, lng, zoom)
+                }
+            },
+            onSaveCameraImmediate = { lat, lng, zoom ->
+                if (!isFollowMode) {
+                    viewModel.saveMapCameraState(lat, lng, zoom)
+                }
+            },
+            recenterTrigger = effectiveRecenterTrigger,
             zoomInTrigger = zoomInTrigger,
             zoomOutTrigger = zoomOutTrigger,
             fitRouteTrigger = fitRouteTrigger,
-            bearing = if (currentLocation?.hasBearing() == true) currentLocation?.bearing else null,
+            bearing = when {
+                currentLocation?.hasBearing() == true && metrics.currentSpeedKmh >= 1.5 -> currentLocation?.bearing
+                deviceHeading != null -> deviceHeading
+                currentLocation?.hasBearing() == true -> currentLocation?.bearing
+                else -> null
+            },
             speedKmh = metrics.currentSpeedKmh,
             transportMode = selectedTransport,
             tripState = tripState,
@@ -202,21 +299,110 @@ fun RouteWakeScreen(
             modifier = Modifier.fillMaxSize()
         )
 
-        // 2. Map Floating Action Controls (Top-Right: Recenter, Zoom In, Zoom Out)
+        val isSheetOpen = activeTab != null
+        val configuration = LocalConfiguration.current
+        val screenHeight = configuration.screenHeightDp.dp
+
+        // Fixed predetermined responsive sheet heights:
+        val normalHeight = remember(screenHeight) {
+            (screenHeight * 0.44f).coerceIn(340.dp, 370.dp)
+        }
+        val expandedHeight = remember(screenHeight) {
+            (screenHeight * 0.65f).coerceIn(480.dp, 530.dp)
+        }
+
+        val density = LocalDensity.current
+        val imeBottom = WindowInsets.ime.getBottom(density)
+        @OptIn(ExperimentalLayoutApi::class)
+        val isKeyboardVisible = WindowInsets.isImeVisible || imeBottom > 0
+
+        // Determine intentional target height:
+        val targetSheetHeight: Dp = when (activeTab) {
+            NavTab.COCKPIT -> {
+                when {
+                    tripState != TripState.IDLE -> expandedHeight
+                    selectedDestination != null -> expandedHeight
+                    isKeyboardVisible -> expandedHeight
+                    else -> normalHeight
+                }
+            }
+            NavTab.FAVORITES, NavTab.HISTORY, NavTab.SETTINGS -> expandedHeight
+            null -> normalHeight
+        }
+
+        val animatedSheetHeight by animateDpAsState(
+            targetValue = targetSheetHeight,
+            animationSpec = tween(
+                durationMillis = 300,
+                easing = FastOutSlowInEasing
+            ),
+            label = "sheet_height_animation"
+        )
+
+        // Default position when sheet is closed: vertically centered on the right
+        val defaultCenterBottomOffset = remember(screenHeight) {
+            (screenHeight / 2) - 74.dp
+        }
+
+        // When sheet opens (cockpit, favorites, etc.): sits directly above the opened option card
+        val targetButtonsBottomOffset = if (isSheetOpen) {
+            (86.dp + targetSheetHeight + 12.dp).coerceAtMost(screenHeight - 160.dp)
+        } else {
+            defaultCenterBottomOffset
+        }
+
+        val animatedButtonsBottomOffset by animateDpAsState(
+            targetValue = targetButtonsBottomOffset,
+            animationSpec = tween(
+                durationMillis = 300,
+                easing = FastOutSlowInEasing
+            ),
+            label = "map_controls_bottom_offset"
+        )
+
+        // 2. Map Floating Action Controls (Right-Center -> sits just above opened option like cockpit: Recenter, Zoom In, Zoom Out)
         Column(
             modifier = Modifier
-                .align(Alignment.TopEnd)
-                .statusBarsPadding()
-                .padding(top = 16.dp, end = 16.dp),
+                .align(Alignment.BottomEnd)
+                .navigationBarsPadding()
+                .padding(bottom = animatedButtonsBottomOffset, end = 16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             IconButton(
                 onClick = {
-                    if (!permissionStatus.hasFineLocation) {
-                        requestPermissions(PermissionDialogReason.RECENTER)
-                    } else {
-                        recenterTrigger++
-                        viewModel.refreshCurrentLocation()
+                    when (val state = prerequisiteState) {
+                        is LocationPrerequisiteState.LocationDisabled -> {
+                            if (state.resolvableException != null) {
+                                try {
+                                    val request = IntentSenderRequest.Builder(state.resolvableException.resolution.intentSender).build()
+                                    locationSettingsLauncher.launch(request)
+                                } catch (_: Exception) {
+                                    showLocationDisabledDialog = true
+                                }
+                            } else {
+                                showLocationDisabledDialog = true
+                            }
+                        }
+                        is LocationPrerequisiteState.PermissionRequired -> {
+                            requestPermissions(PermissionDialogReason.RECENTER)
+                        }
+                        is LocationPrerequisiteState.HighAccuracyDisabled -> {
+                            if (state.resolvableException != null) {
+                                try {
+                                    val request = IntentSenderRequest.Builder(state.resolvableException.resolution.intentSender).build()
+                                    locationSettingsLauncher.launch(request)
+                                } catch (_: Exception) {
+                                    showHighAccuracyDialog = true
+                                }
+                            } else {
+                                showHighAccuracyDialog = true
+                            }
+                        }
+                        else -> {
+                            localRecenterTrigger++
+                            viewModel.initiateFollowMode(forceRecenter = true)
+                            viewModel.refreshCurrentLocation()
+                        }
                     }
                 },
                 modifier = Modifier
@@ -228,7 +414,7 @@ fun RouteWakeScreen(
                 Icon(
                     imageVector = Icons.Default.MyLocation,
                     contentDescription = "Recenter",
-                    tint = if (permissionStatus.hasFineLocation) ElectricBlue else AmberAction,
+                    tint = if (prerequisiteState is LocationPrerequisiteState.Satisfied) ElectricBlue else AmberAction,
                     modifier = Modifier.size(20.dp)
                 )
             }
@@ -270,8 +456,52 @@ fun RouteWakeScreen(
             }
         }
 
-        // 2c. Persistent Permission Warning Banner if critical permissions missing and sheet is closed
-        if (!permissionStatus.hasAllCritical && tripState == TripState.IDLE && activeTab == null) {
+        // 2b. Location Prerequisite Warning Banner (shown when device location or high accuracy is disabled)
+        if (prerequisiteState is LocationPrerequisiteState.LocationDisabled && activeTab == null) {
+            val locState = prerequisiteState as LocationPrerequisiteState.LocationDisabled
+            LocationPrerequisiteBanner(
+                title = "Device Location is turned off",
+                actionLabel = "ENABLE",
+                onAction = {
+                    if (locState.resolvableException != null) {
+                        try {
+                            val request = IntentSenderRequest.Builder(locState.resolvableException.resolution.intentSender).build()
+                            locationSettingsLauncher.launch(request)
+                        } catch (_: Exception) {
+                            showLocationDisabledDialog = true
+                        }
+                    } else {
+                        showLocationDisabledDialog = true
+                    }
+                },
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = if (routeInfo != null && routeInfo!!.points.isNotEmpty()) 64.dp else 16.dp, start = 16.dp, end = 76.dp)
+            )
+        } else if (prerequisiteState is LocationPrerequisiteState.HighAccuracyDisabled && activeTab == null) {
+            val highState = prerequisiteState as LocationPrerequisiteState.HighAccuracyDisabled
+            LocationPrerequisiteBanner(
+                title = "High accuracy GPS is unavailable",
+                actionLabel = "SETTINGS",
+                onAction = {
+                    if (highState.resolvableException != null) {
+                        try {
+                            val request = IntentSenderRequest.Builder(highState.resolvableException.resolution.intentSender).build()
+                            locationSettingsLauncher.launch(request)
+                        } catch (_: Exception) {
+                            showHighAccuracyDialog = true
+                        }
+                    } else {
+                        showHighAccuracyDialog = true
+                    }
+                },
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = if (routeInfo != null && routeInfo!!.points.isNotEmpty()) 64.dp else 16.dp, start = 16.dp, end = 76.dp)
+            )
+        } else if (!permissionStatus.hasAllCritical && tripState == TripState.IDLE && activeTab == null) {
             PermissionWarningBanner(
                 status = permissionStatus,
                 onEnableClicked = {
@@ -280,7 +510,7 @@ fun RouteWakeScreen(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .statusBarsPadding()
-                    .padding(top = if (settings.trafficEnabled && routeInfo != null && routeInfo!!.points.isNotEmpty()) 64.dp else 16.dp, start = 16.dp, end = 76.dp)
+                    .padding(top = if (routeInfo != null && routeInfo!!.points.isNotEmpty()) 64.dp else 16.dp, start = 16.dp, end = 76.dp)
             )
         }
 
@@ -300,7 +530,6 @@ fun RouteWakeScreen(
         )
 
         // 4. Slide-up Sheet Container (Single stable floating card above bottom navigation)
-        val isSheetOpen = activeTab != null
         val currentTabTitle = when (activeTab) {
             NavTab.COCKPIT -> "Navigation Cockpit"
             NavTab.FAVORITES -> "Favorites"
@@ -308,49 +537,6 @@ fun RouteWakeScreen(
             NavTab.SETTINGS -> "Settings"
             null -> ""
         }
-
-        // Fixed predetermined responsive sheet heights:
-        val configuration = LocalConfiguration.current
-        val screenHeight = configuration.screenHeightDp.dp
-
-        // NORMAL_HEIGHT: Compact state leaving ample map visibility above
-        val normalHeight = remember(screenHeight) {
-            (screenHeight * 0.44f).coerceIn(340.dp, 370.dp)
-        }
-        // EXPANDED_HEIGHT: Predetermined height for Search + Keyboard, Destination Selected,
-        // and content-rich tabs (Favorites, History, Settings).
-        // Remains fixed; search results or content NEVER resize this outer height.
-        val expandedHeight = remember(screenHeight) {
-            (screenHeight * 0.65f).coerceIn(480.dp, 530.dp)
-        }
-
-        val density = LocalDensity.current
-        val imeBottom = WindowInsets.ime.getBottom(density)
-        @OptIn(ExperimentalLayoutApi::class)
-        val isKeyboardVisible = WindowInsets.isImeVisible || imeBottom > 0
-
-        // Determine intentional target height:
-        val targetSheetHeight: Dp = when (activeTab) {
-            NavTab.COCKPIT -> {
-                when {
-                    tripState != TripState.IDLE -> expandedHeight
-                    selectedDestination != null -> expandedHeight // STATE 3: Destination selected - STAYS expanded!
-                    isKeyboardVisible -> expandedHeight // STATE 2: Search + Keyboard - expands upward!
-                    else -> normalHeight // STATE 1: Normal Cockpit - compact!
-                }
-            }
-            NavTab.FAVORITES, NavTab.HISTORY, NavTab.SETTINGS -> expandedHeight
-            null -> normalHeight
-        }
-
-        val animatedSheetHeight by animateDpAsState(
-            targetValue = targetSheetHeight,
-            animationSpec = tween(
-                durationMillis = 300,
-                easing = FastOutSlowInEasing
-            ),
-            label = "sheet_height_animation"
-        )
 
         Box(
             modifier = Modifier
@@ -459,7 +645,6 @@ fun RouteWakeScreen(
                                 onUpdateVibration = { viewModel.updateVibration(it) },
                                 onUpdateDefaultRadius = { viewModel.updateDefaultRadius(it) },
                                 onUpdateSatellite = { viewModel.updateSatellite(it) },
-                                onUpdateTrafficEnabled = { viewModel.updateTrafficEnabled(it) },
                                 onTestAlarmSound = { viewModel.testAlarmTone(it) }
                             )
                         }
@@ -498,7 +683,57 @@ fun RouteWakeScreen(
             )
         }
 
-        // 8. Permission Rationale & Request Dialog
+        // 8. Location Service Disabled Dialog (Custom fallback / manual dialog)
+        if (showLocationDisabledDialog && prerequisiteState is LocationPrerequisiteState.LocationDisabled) {
+            val state = prerequisiteState as LocationPrerequisiteState.LocationDisabled
+            LocationServiceDisabledDialog(
+                onEnableLocation = {
+                    if (state.resolvableException != null) {
+                        try {
+                            val request = IntentSenderRequest.Builder(state.resolvableException.resolution.intentSender).build()
+                            locationSettingsLauncher.launch(request)
+                        } catch (_: Exception) {
+                            LocationPrerequisiteManager.openLocationSettings(context)
+                        }
+                    } else {
+                        LocationPrerequisiteManager.openLocationSettings(context)
+                    }
+                },
+                onOpenSettings = {
+                    LocationPrerequisiteManager.openLocationSettings(context)
+                },
+                onDismiss = {
+                    showLocationDisabledDialog = false
+                }
+            )
+        }
+
+        // 9. High Accuracy Disabled Dialog
+        if (showHighAccuracyDialog && prerequisiteState is LocationPrerequisiteState.HighAccuracyDisabled) {
+            val state = prerequisiteState as LocationPrerequisiteState.HighAccuracyDisabled
+            HighAccuracyDisabledDialog(
+                onEnableHighAccuracy = {
+                    if (state.resolvableException != null) {
+                        try {
+                            val request = IntentSenderRequest.Builder(state.resolvableException.resolution.intentSender).build()
+                            locationSettingsLauncher.launch(request)
+                        } catch (_: Exception) {
+                            LocationPrerequisiteManager.openLocationSettings(context)
+                        }
+                    } else {
+                        LocationPrerequisiteManager.openLocationSettings(context)
+                    }
+                },
+                onOpenSettings = {
+                    LocationPrerequisiteManager.openLocationSettings(context)
+                },
+                onDismiss = {
+                    showHighAccuracyDialog = false
+                }
+            )
+        }
+
+        // 10. Permission Rationale & Request Dialog
         if (showPermissionDialog) {
             PermissionRationaleDialog(
                 status = permissionStatus,

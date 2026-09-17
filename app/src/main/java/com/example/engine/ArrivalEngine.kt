@@ -85,7 +85,9 @@ class ArrivalEngine(
 
     fun snooze(seconds: Int = 60, tone: AlarmTone, vibrationEnabled: Boolean) {
         audioEngine.stopAlarm()
+        AlarmAudioEngine.stopAll()
         vibrationEngine.stopVibration()
+        VibrationEngine.stopAll(context)
 
         snoozeJob?.cancel()
         snoozeJob = scope.launch {
@@ -103,7 +105,9 @@ class ArrivalEngine(
     fun dismiss(finalDistanceMeters: Double) {
         snoozeJob?.cancel()
         audioEngine.stopAlarm()
+        AlarmAudioEngine.stopAll()
         vibrationEngine.stopVibration()
+        VibrationEngine.stopAll(context)
 
         val dest = activeDestination
         val durationSec = ((System.currentTimeMillis() - tripStartTimeMs) / 1000).coerceAtLeast(1)
@@ -142,7 +146,9 @@ class ArrivalEngine(
     fun cancelTrip() {
         snoozeJob?.cancel()
         audioEngine.stopAlarm()
+        AlarmAudioEngine.stopAll()
         vibrationEngine.stopVibration()
+        VibrationEngine.stopAll(context)
         _tripState.value = TripState.IDLE
         activeDestination = null
     }

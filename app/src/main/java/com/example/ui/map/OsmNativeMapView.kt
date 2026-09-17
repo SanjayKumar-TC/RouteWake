@@ -16,6 +16,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.animation.DecelerateInterpolator
+import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -33,6 +34,11 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.example.data.local.MapCameraState
+import com.example.data.local.UserPreferences
 import com.example.data.model.CongestionLevel
 import com.example.data.model.Destination
 import com.example.data.model.IncidentSeverity
@@ -47,6 +53,9 @@ import com.example.ui.components.DestinationInfoPopup
 import com.example.ui.components.MapInformationCard
 import com.example.ui.components.MapInformationCardType
 import com.example.ui.components.TrafficInfoPopup
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import org.osmdroid.events.MapEventsReceiver
 import org.osmdroid.events.MapListener
 import org.osmdroid.events.ScrollEvent
@@ -56,8 +65,40 @@ import org.osmdroid.util.BoundingBox
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.CustomZoomButtonsController
 import org.osmdroid.views.MapView
+import org.osmdroid.views.Projection
 import org.osmdroid.views.overlay.*
+import org.osmdroid.views.overlay.gestures.RotationGestureOverlay
 import org.osmdroid.views.overlay.infowindow.InfoWindow
+
+const val MIN_AUTOMATIC_NAVIGATION_ZOOM = 15.5
+
+/**
+ * Safely fits a bounding box within the MapView while strictly adhering to the
+ * MIN_AUTOMATIC_NAVIGATION_ZOOM floor to prevent the camera from zooming out to
+ * an unreadable country or world level.
+ */
+private fun safeFitBoundingBox(
+    mapView: MapView,
+    box: BoundingBox,
+    border: Int = 110,
+    animationSpeed: Long = 400L,
+    fallbackCenter: GeoPoint? = null
+) {
+    val width = mapView.width - 2 * border
+    val height = mapView.height - 2 * border
+    val calculatedZoom = if (width > 0 && height > 0) {
+        MapView.getTileSystem().getBoundingBoxZoom(box, width, height)
+    } else {
+        MIN_AUTOMATIC_NAVIGATION_ZOOM
+    }
+    val clampedZoom = maxOf(calculatedZoom, MIN_AUTOMATIC_NAVIGATION_ZOOM)
+    val targetCenter = if (calculatedZoom < MIN_AUTOMATIC_NAVIGATION_ZOOM && fallbackCenter != null) {
+        fallbackCenter
+    } else {
+        box.centerWithDateLine
+    }
+    mapView.controller?.animateTo(targetCenter, clampedZoom, animationSpeed)
+}
 
 /**
  * Premium Native Android Map component using osmdroid (OpenStreetMap).
@@ -83,6 +124,11 @@ fun OsmNativeMapView(
     routePoints: List<RoutePoint>,
     isSatellite: Boolean,
     modifier: Modifier = Modifier,
+    initialCameraState: MapCameraState? = null,
+    isFollowMode: Boolean = true,
+    onManualNavigation: ((lat: Double, lng: Double, zoom: Double) -> Unit)? = null,
+    onCameraChanged: ((lat: Double, lng: Double, zoom: Double) -> Unit)? = null,
+    onSaveCameraImmediate: ((lat: Double, lng: Double, zoom: Double) -> Unit)? = null,
     recenterTrigger: Int = 0,
     zoomInTrigger: Int = 0,
     zoomOutTrigger: Int = 0,
@@ -100,7 +146,44 @@ fun OsmNativeMapView(
     onStartTrip: (() -> Unit)? = null
 ) {
     var mapViewRef by remember { mutableStateOf<MapView?>(null) }
-    var hasCenteredInitially by remember { mutableStateOf(false) }
+    var hasCenteredOnFirstFix by remember { mutableStateOf(false) }
+    val coroutineScope = rememberCoroutineScope()
+    var debouncedSaveJob by remember { mutableStateOf<Job?>(null) }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
+                mapViewRef?.let { mv ->
+                    val center = mv.mapCenter
+                    val zoom = mv.zoomLevelDouble
+                    if (center != null && zoom != null) {
+                        val lat = center.latitude
+                        val lng = center.longitude
+                        if (UserPreferences.isValidCameraState(lat, lng, zoom)) {
+                            onSaveCameraImmediate?.invoke(lat, lng, zoom)
+                        }
+                    }
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            debouncedSaveJob?.cancel()
+            mapViewRef?.let { mv ->
+                val center = mv.mapCenter
+                val zoom = mv.zoomLevelDouble
+                if (center != null && zoom != null) {
+                    val lat = center.latitude
+                    val lng = center.longitude
+                    if (UserPreferences.isValidCameraState(lat, lng, zoom)) {
+                        onSaveCameraImmediate?.invoke(lat, lng, zoom)
+                    }
+                }
+            }
+        }
+    }
 
     // RouteWake night cockpit color filter for OpenStreetMap Mapnik tiles.
     val darkMapColorFilter = remember {
@@ -117,8 +200,18 @@ fun OsmNativeMapView(
 
     // Handle user recenter request
     LaunchedEffect(recenterTrigger) {
-        if (recenterTrigger > 0 && currentLat != null && currentLng != null) {
-            mapViewRef?.controller?.animateTo(GeoPoint(currentLat, currentLng), 16.0, 400L)
+        if (recenterTrigger > 0) {
+            mapViewRef?.setMapOrientation(0.0f, true)
+            if (currentLat != null && currentLng != null) {
+                val currZoom = mapViewRef?.zoomLevelDouble ?: 16.0
+                val targetZoom = if (currZoom < MIN_AUTOMATIC_NAVIGATION_ZOOM) 16.0 else currZoom
+                mapViewRef?.controller?.animateTo(GeoPoint(currentLat, currentLng), targetZoom, 400L)
+                debouncedSaveJob?.cancel()
+                debouncedSaveJob = coroutineScope.launch {
+                    delay(450L)
+                    onCameraChanged?.invoke(currentLat, currentLng, targetZoom)
+                }
+            }
         }
     }
 
@@ -138,6 +231,7 @@ fun OsmNativeMapView(
     // Handle Fit Route request
     LaunchedEffect(fitRouteTrigger) {
         if (fitRouteTrigger > 0 && mapViewRef != null) {
+            val mv = mapViewRef ?: return@LaunchedEffect
             if (destination != null && currentLat != null && currentLng != null) {
                 val minLat = minOf(currentLat, destination.latitude)
                 val maxLat = maxOf(currentLat, destination.latitude)
@@ -152,29 +246,59 @@ fun OsmNativeMapView(
                     minLat - latMargin,
                     minLng - lngMargin
                 )
-                mapViewRef?.zoomToBoundingBox(box, true, 120)
+                safeFitBoundingBox(
+                    mv,
+                    box,
+                    border = 120,
+                    fallbackCenter = GeoPoint(destination.latitude, destination.longitude)
+                )
             } else if (destination != null) {
-                mapViewRef?.controller?.animateTo(GeoPoint(destination.latitude, destination.longitude), 15.0, 400L)
+                val currZoom = mv.zoomLevelDouble
+                val targetZoom = if (currZoom < MIN_AUTOMATIC_NAVIGATION_ZOOM) 16.0 else currZoom
+                mv.controller?.animateTo(GeoPoint(destination.latitude, destination.longitude), targetZoom, 400L)
             } else if (currentLat != null && currentLng != null) {
-                mapViewRef?.controller?.animateTo(GeoPoint(currentLat, currentLng), 16.0, 400L)
+                val currZoom = mv.zoomLevelDouble
+                val targetZoom = if (currZoom < MIN_AUTOMATIC_NAVIGATION_ZOOM) 16.0 else currZoom
+                mv.controller?.animateTo(GeoPoint(currentLat, currentLng), targetZoom, 400L)
             }
         }
     }
 
-    // Center immediately on the very first valid GPS fix only once
-    LaunchedEffect(currentLat, currentLng) {
-        if (!hasCenteredInitially && currentLat != null && currentLng != null) {
-            hasCenteredInitially = true
-            mapViewRef?.controller?.setZoom(15.0)
-            mapViewRef?.controller?.setCenter(GeoPoint(currentLat, currentLng))
+    // Center on valid GPS fix when follow mode is active
+    LaunchedEffect(currentLat, currentLng, isFollowMode, mapViewRef) {
+        val mv = mapViewRef ?: return@LaunchedEffect
+        if (currentLat == null || currentLng == null) {
+            // Location is disabled or unavailable; reset the first-fix flag so that
+            // when location is subsequently enabled, it will immediately direct to current location
+            hasCenteredOnFirstFix = false
+        } else if (isFollowMode) {
+            if (!hasCenteredOnFirstFix) {
+                hasCenteredOnFirstFix = true
+                mv.controller?.setZoom(16.0)
+                mv.controller?.setCenter(GeoPoint(currentLat, currentLng))
+                onCameraChanged?.invoke(currentLat, currentLng, 16.0)
+            } else {
+                val center = mv.mapCenter
+                if (center != null) {
+                    val dist = FloatArray(1)
+                    Location.distanceBetween(center.latitude, center.longitude, currentLat, currentLng, dist)
+                    if (dist[0] >= 1.5f) {
+                        val currZoom = mv.zoomLevelDouble
+                        mv.controller?.animateTo(GeoPoint(currentLat, currentLng), currZoom, 300L)
+                    }
+                } else {
+                    mv.controller?.animateTo(GeoPoint(currentLat, currentLng))
+                }
+            }
         }
     }
 
     // Frame destination only if not already visible in current viewport
     LaunchedEffect(destination?.id) {
         if (destination != null && mapViewRef != null) {
+            val mv = mapViewRef ?: return@LaunchedEffect
             val destGeo = GeoPoint(destination.latitude, destination.longitude)
-            val currentBox = mapViewRef?.boundingBox
+            val currentBox = mv.boundingBox
             val isAlreadyVisible = currentBox != null &&
                     currentBox.latSouth <= destGeo.latitude &&
                     currentBox.latNorth >= destGeo.latitude &&
@@ -196,9 +320,16 @@ fun OsmNativeMapView(
                         minLat - latMargin,
                         minLng - lngMargin
                     )
-                    mapViewRef?.zoomToBoundingBox(box, true, 110)
+                    safeFitBoundingBox(
+                        mv,
+                        box,
+                        border = 110,
+                        fallbackCenter = destGeo
+                    )
                 } else {
-                    mapViewRef?.controller?.animateTo(destGeo, 15.0, 500L)
+                    val currZoom = mv.zoomLevelDouble
+                    val targetZoom = if (currZoom < MIN_AUTOMATIC_NAVIGATION_ZOOM) 16.0 else currZoom
+                    mv.controller?.animateTo(destGeo, targetZoom, 500L)
                 }
             }
         }
@@ -207,9 +338,11 @@ fun OsmNativeMapView(
     // Smoothly animate camera toward destination upon confirmed arrival
     LaunchedEffect(tripState) {
         if (tripState == TripState.ARRIVED && destination != null && mapViewRef != null) {
+            val currZoom = mapViewRef?.zoomLevelDouble ?: 16.0
+            val targetZoom = if (currZoom < MIN_AUTOMATIC_NAVIGATION_ZOOM) 16.0 else currZoom
             mapViewRef?.controller?.animateTo(
                 GeoPoint(destination.latitude, destination.longitude),
-                16.0,
+                targetZoom,
                 650L
             )
         }
@@ -264,58 +397,106 @@ fun OsmNativeMapView(
         AndroidView(
             factory = { ctx ->
                 MapView(ctx).apply {
+                    layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
                     mapViewRef = this
                     setMultiTouchControls(true)
                     zoomController.setVisibility(CustomZoomButtonsController.Visibility.NEVER)
                     isTilesScaledToDpi = true
-                    isHorizontalMapRepetitionEnabled = true
+                    isHorizontalMapRepetitionEnabled = false
                     isVerticalMapRepetitionEnabled = false
+                    minZoomLevel = 2.0
+                    maxZoomLevel = 20.0
+                    setScrollableAreaLimitDouble(BoundingBox(85.05112878, 180.0, -85.05112878, -180.0))
+                    setScrollableAreaLimitLatitude(85.05112878, -85.05112878, 0)
+                    setScrollableAreaLimitLongitude(-180.0, 180.0, 0)
                     InfoWindow.closeAllInfoWindowsOn(this)
+
+                    val scheduleDebouncedSave: () -> Unit = {
+                        val center = mapCenter
+                        val zoom = zoomLevelDouble
+                        if (center != null && zoom != null) {
+                            val lat = center.latitude
+                            val lng = center.longitude
+                            if (UserPreferences.isValidCameraState(lat, lng, zoom)) {
+                                debouncedSaveJob?.cancel()
+                                debouncedSaveJob = coroutineScope.launch {
+                                    delay(500L)
+                                    onManualNavigation?.invoke(lat, lng, zoom)
+                                    onCameraChanged?.invoke(lat, lng, zoom)
+                                }
+                            }
+                        }
+                    }
+
+                    var isUserInteracting = false
+                    setOnTouchListener { _, motionEvent ->
+                        when (motionEvent.actionMasked) {
+                            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                                isUserInteracting = true
+                            }
+                            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                                isUserInteracting = false
+                                scheduleDebouncedSave()
+                            }
+                        }
+                        false
+                    }
 
                     addMapListener(object : MapListener {
                         override fun onScroll(event: ScrollEvent?): Boolean {
-                            trafficAnchorGeoPoint?.let { geo ->
-                                val pt = Point()
-                                projection?.toPixels(geo, pt)
-                                val newAnchor = Offset(pt.x.toFloat(), pt.y.toFloat())
-                                val curr = activeCardState
-                                if (curr is MapInformationCardType.RouteTraffic) {
-                                    activeCardState = curr.copy(anchorPx = newAnchor)
+                            if (activeCardState !is MapInformationCardType.None) {
+                                trafficAnchorGeoPoint?.let { geo ->
+                                    val pt = Point()
+                                    projection?.toPixels(geo, pt)
+                                    val newAnchor = Offset(pt.x.toFloat(), pt.y.toFloat())
+                                    val curr = activeCardState
+                                    if (curr is MapInformationCardType.RouteTraffic) {
+                                        activeCardState = curr.copy(anchorPx = newAnchor)
+                                    }
+                                }
+                                destAnchorGeoPoint?.let { geo ->
+                                    val pt = Point()
+                                    projection?.toPixels(geo, pt)
+                                    val density = ctx.resources.displayMetrics.density
+                                    val newAnchor = Offset(pt.x.toFloat(), pt.y.toFloat() - (48f * density))
+                                    val curr = activeCardState
+                                    if (curr is MapInformationCardType.DestinationInfo) {
+                                        activeCardState = curr.copy(anchorPx = newAnchor)
+                                    }
                                 }
                             }
-                            destAnchorGeoPoint?.let { geo ->
-                                val pt = Point()
-                                projection?.toPixels(geo, pt)
-                                val density = ctx.resources.displayMetrics.density
-                                val newAnchor = Offset(pt.x.toFloat(), pt.y.toFloat() - (48f * density))
-                                val curr = activeCardState
-                                if (curr is MapInformationCardType.DestinationInfo) {
-                                    activeCardState = curr.copy(anchorPx = newAnchor)
-                                }
+                            if (isUserInteracting) {
+                                scheduleDebouncedSave()
                             }
                             return false
                         }
 
                         override fun onZoom(event: ZoomEvent?): Boolean {
-                            trafficAnchorGeoPoint?.let { geo ->
-                                val pt = Point()
-                                projection?.toPixels(geo, pt)
-                                val newAnchor = Offset(pt.x.toFloat(), pt.y.toFloat())
-                                val curr = activeCardState
-                                if (curr is MapInformationCardType.RouteTraffic) {
-                                    activeCardState = curr.copy(anchorPx = newAnchor)
+                            if (activeCardState !is MapInformationCardType.None) {
+                                trafficAnchorGeoPoint?.let { geo ->
+                                    val pt = Point()
+                                    projection?.toPixels(geo, pt)
+                                    val newAnchor = Offset(pt.x.toFloat(), pt.y.toFloat())
+                                    val curr = activeCardState
+                                    if (curr is MapInformationCardType.RouteTraffic) {
+                                        activeCardState = curr.copy(anchorPx = newAnchor)
+                                    }
+                                }
+                                destAnchorGeoPoint?.let { geo ->
+                                    val pt = Point()
+                                    projection?.toPixels(geo, pt)
+                                    val density = ctx.resources.displayMetrics.density
+                                    val newAnchor = Offset(pt.x.toFloat(), pt.y.toFloat() - (48f * density))
+                                    val curr = activeCardState
+                                    if (curr is MapInformationCardType.DestinationInfo) {
+                                        activeCardState = curr.copy(anchorPx = newAnchor)
+                                    }
                                 }
                             }
-                            destAnchorGeoPoint?.let { geo ->
-                                val pt = Point()
-                                projection?.toPixels(geo, pt)
-                                val density = ctx.resources.displayMetrics.density
-                                val newAnchor = Offset(pt.x.toFloat(), pt.y.toFloat() - (48f * density))
-                                val curr = activeCardState
-                                if (curr is MapInformationCardType.DestinationInfo) {
-                                    activeCardState = curr.copy(anchorPx = newAnchor)
-                                }
-                            }
+                            scheduleDebouncedSave()
                             return false
                         }
                     })
@@ -327,10 +508,30 @@ fun OsmNativeMapView(
                         overlayManager.tilesOverlay.setColorFilter(darkMapColorFilter)
                     }
 
-                    val startLat = currentLat ?: 37.7749
-                    val startLng = currentLng ?: -122.4194
-                    controller.setZoom(14.0)
-                    controller.setCenter(GeoPoint(startLat, startLng))
+                    if (isFollowMode && currentLat != null && currentLng != null) {
+                        // Location is ON and Follow Mode is active: prioritize centering on current GPS location
+                        controller.setZoom(16.0)
+                        controller.setCenter(GeoPoint(currentLat, currentLng))
+                        hasCenteredOnFirstFix = true
+                        onCameraChanged?.invoke(currentLat, currentLng, 16.0)
+                    } else if (initialCameraState != null) {
+                        // Location is OFF or manual navigation saved state: respect and direct to saved camera state
+                        val clampedLat = initialCameraState.latitude.coerceIn(-85.05112878, 85.05112878)
+                        val clampedLng = initialCameraState.longitude.coerceIn(-180.0, 180.0)
+                        val clampedZoom = initialCameraState.zoom.coerceIn(2.0, 20.0)
+                        controller.setZoom(clampedZoom)
+                        controller.setCenter(GeoPoint(clampedLat, clampedLng))
+                        hasCenteredOnFirstFix = false
+                    } else if (currentLat != null && currentLng != null) {
+                        controller.setZoom(16.0)
+                        controller.setCenter(GeoPoint(currentLat, currentLng))
+                        hasCenteredOnFirstFix = true
+                    } else {
+                        // Default fallback
+                        controller.setZoom(16.0)
+                        controller.setCenter(GeoPoint(37.7749, -122.4194))
+                        hasCenteredOnFirstFix = false
+                    }
 
                     val holder = MapOverlayHolder(this, ctx, onMapClick)
                     holder.onTrafficSegmentSelected = { seg, geoPoint ->
@@ -427,6 +628,13 @@ fun OsmNativeMapView(
                     }
                     holder.isCardOpen = false
                 }
+                if (isFollowMode && currentLat != null && currentLng != null && !hasCenteredOnFirstFix) {
+                    hasCenteredOnFirstFix = true
+                    mapView.controller?.setZoom(16.0)
+                    mapView.controller?.setCenter(GeoPoint(currentLat, currentLng))
+                    onCameraChanged?.invoke(currentLat, currentLng, 16.0)
+                }
+
                 holder?.update(
                     currentLat = currentLat,
                     currentLng = currentLng,
@@ -449,6 +657,15 @@ fun OsmNativeMapView(
                 activeCardState = MapInformationCardType.None
                 trafficAnchorGeoPoint = null
                 destAnchorGeoPoint = null
+                val center = mapView.mapCenter
+                val zoom = mapView.zoomLevelDouble
+                if (center != null && zoom != null) {
+                    val lat = center.latitude
+                    val lng = center.longitude
+                    if (UserPreferences.isValidCameraState(lat, lng, zoom)) {
+                        onSaveCameraImmediate?.invoke(lat, lng, zoom)
+                    }
+                }
                 val holder = mapView.getTag() as? MapOverlayHolder
                 holder?.release()
                 mapView.onDetach()
@@ -480,6 +697,31 @@ fun OsmNativeMapView(
                 h?.isCardOpen = false
             }
         )
+    }
+}
+
+/**
+ * Custom osmdroid Marker with smooth scale and fade-in entrance animation on placement.
+ * Uses the destination marker's pin-tip anchor point as the canvas scale pivot so the tip
+ * remains locked to the precise GPS coordinate while the pin smoothly pops and scales in.
+ */
+private class AnimatedDestinationMarker(mapView: MapView) : Marker(mapView) {
+    var scale: Float = 1.0f
+
+    override fun draw(canvas: Canvas, projection: Projection) {
+        if (!isEnabled || icon == null) return
+        val pos = position ?: return
+        if (scale >= 0.99f && scale <= 1.01f) {
+            super.draw(canvas, projection)
+        } else {
+            val pt = Point()
+            projection.toPixels(pos, pt)
+            canvas.save()
+            // Anchor point (pin tip) is at (pt.x, pt.y)
+            canvas.scale(scale, scale, pt.x.toFloat(), pt.y.toFloat())
+            super.draw(canvas, projection)
+            canvas.restore()
+        }
     }
 }
 
@@ -623,15 +865,53 @@ private class MapOverlayHolder(
         outlinePaint.strokeWidth = 4.5f
         outlinePaint.pathEffect = DashPathEffect(floatArrayOf(24f, 12f), 0f)
         infoWindow = null
+        isEnabled = false
     }
 
     // 7. Native Live GPS Puck (Electric Blue Beacon with Breathing Halo and Heading Cone)
     val userBeaconOverlay = UserBeaconOverlay(mapView)
 
-    // 8. Destination Pin Marker with Vector Transport Icon
-    val destMarker = Marker(mapView).apply {
+    // 8. Multi-touch Map Rotation Gesture Overlay
+    val rotationGestureOverlay = RotationGestureOverlay(mapView).apply {
+        isEnabled = true
+    }
+
+    // 9. Destination Pin Marker with Vector Transport Icon and subtle scale/fade entrance animation
+    val destMarker = AnimatedDestinationMarker(mapView).apply {
         setAnchor(0.5f, 49f / 52f) // Pin tip anchor precisely on destination coordinates
         infoWindow = null
+        isEnabled = false
+    }
+
+    private var markerPlacementAnimator: ValueAnimator? = null
+
+    private fun playMarkerPlacementAnimation() {
+        markerPlacementAnimator?.cancel()
+        destMarker.scale = 0.35f
+        destMarker.alpha = 0.0f
+
+        val anim = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 380L
+            interpolator = OvershootInterpolator(1.35f)
+            addUpdateListener { animator ->
+                val progress = animator.animatedFraction
+                val animVal = animator.animatedValue as Float
+                // Subtle scale: start at 0.35, expand with a gentle overshoot bounce to 1.0
+                destMarker.scale = (0.35f + 0.65f * animVal).coerceIn(0.1f, 1.35f)
+                // Fade-in: complete opacity fade within the first 60% of duration
+                destMarker.alpha = (progress / 0.6f).coerceIn(0.0f, 1.0f)
+                mapView.postInvalidateOnAnimation()
+            }
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    destMarker.scale = 1.0f
+                    destMarker.alpha = 1.0f
+                    mapView.postInvalidate()
+                }
+            })
+            start()
+        }
+        markerPlacementAnimator = anim
     }
 
     private var lastDestination: Destination? = null
@@ -658,6 +938,7 @@ private class MapOverlayHolder(
         mapView.overlays.add(radiusPolygon)
         mapView.overlays.add(userBeaconOverlay)
         mapView.overlays.add(destMarker)
+        mapView.overlays.add(rotationGestureOverlay)
 
         // Completely disable default white osmdroid InfoWindows across all overlays
         destMarker.infoWindow = null
@@ -917,21 +1198,13 @@ private class MapOverlayHolder(
         } else {
             if (userBeaconOverlay.isEnabled) {
                 userBeaconOverlay.isEnabled = false
+                userBeaconOverlay.clearLocation()
                 needsInvalidate = true
             }
         }
 
         // 2. Update Destination Marker & Geofence
         if (destination != null) {
-            if (destPositionChanged) {
-                lastDestLat = destination.latitude
-                lastDestLng = destination.longitude
-                destMarker.position = GeoPoint(destination.latitude, destination.longitude)
-                destMarker.isEnabled = true
-                needsInvalidate = true
-                android.util.Log.d("RouteWakeTiming", "MARKER_UPDATED: Destination marker placed at (${destination.latitude}, ${destination.longitude})")
-            }
-
             if (destPropsChanged || cachedDestDrawable == null) {
                 cachedDestDrawable = createDestinationPinDrawable(
                     context = context,
@@ -940,6 +1213,16 @@ private class MapOverlayHolder(
                 )
                 destMarker.icon = cachedDestDrawable
                 needsInvalidate = true
+            }
+
+            if (destPositionChanged) {
+                lastDestLat = destination.latitude
+                lastDestLng = destination.longitude
+                destMarker.position = GeoPoint(destination.latitude, destination.longitude)
+                destMarker.isEnabled = true
+                needsInvalidate = true
+                android.util.Log.d("RouteWakeTiming", "MARKER_UPDATED: Destination marker placed at (${destination.latitude}, ${destination.longitude})")
+                playMarkerPlacementAnimation()
             }
 
             // Update Destination Geofence (The ONLY radius circle)
@@ -987,6 +1270,9 @@ private class MapOverlayHolder(
             }
         } else {
             if (lastDestLat != null) {
+                markerPlacementAnimator?.cancel()
+                destMarker.scale = 1.0f
+                destMarker.alpha = 1.0f
                 lastDestLat = null
                 lastDestLng = null
                 destMarker.isEnabled = false
@@ -1240,6 +1526,8 @@ private class MapOverlayHolder(
     }
 
     fun release() {
+        markerPlacementAnimator?.cancel()
+        markerPlacementAnimator = null
         routeDrawingAnimator?.cancel()
         routeDrawingAnimator = null
         onDismissDestination?.invoke()
@@ -1298,6 +1586,17 @@ private class UserBeaconOverlay(
         style = Paint.Style.FILL
     }
     private val headingPath = Path()
+    private val pointerPath = Path()
+    private val pointerFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = 0xFF0284C7.toInt() // Deep sky blue
+    }
+    private val pointerBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = Color.WHITE
+        strokeJoin = Paint.Join.ROUND
+        strokeCap = Paint.Cap.ROUND
+    }
 
     fun updateLocation(
         lat: Double,
@@ -1309,9 +1608,8 @@ private class UserBeaconOverlay(
         val now = SystemClock.uptimeMillis()
         lastFixTimeMs = now
 
-        // Reliable bearing check: only show directional cone if device is actually moving
-        // (prevents erratic rotation when stationary)
-        val reliable = (bearing != null && bearing != 0f && speedKmh >= 1.5)
+        // Reliable bearing check: show directional indicator when bearing is provided (from GPS bearing or device compass)
+        val reliable = (bearing != null && !bearing.isNaN())
         this.bearing = bearing
         this.isReliableBearing = reliable
 
@@ -1328,6 +1626,16 @@ private class UserBeaconOverlay(
         Location.distanceBetween(displayLat!!, displayLng!!, lat, lng, dist)
         val jumpDistMeters = dist[0]
 
+        // If movement is negligible (< 0.25m), skip animation and do a single light redraw
+        if (jumpDistMeters < 0.25f) {
+            displayLat = lat
+            displayLng = lng
+            targetLat = lat
+            targetLng = lng
+            mapView.postInvalidate()
+            return
+        }
+
         // If jump is large (> 75m) or user is near destination, prioritize freshness over animation
         if (jumpDistMeters > 75f || nearDest) {
             animator?.cancel()
@@ -1337,7 +1645,7 @@ private class UserBeaconOverlay(
             targetLng = lng
             mapView.postInvalidate()
         } else {
-            // Presentation smoothing only: smooth slide over 280ms
+            // Presentation smoothing only: smooth slide over 220ms
             val startLat = displayLat!!
             val startLng = displayLng!!
             targetLat = lat
@@ -1345,7 +1653,7 @@ private class UserBeaconOverlay(
 
             animator?.cancel()
             animator = ValueAnimator.ofFloat(0f, 1f).apply {
-                duration = 280L
+                duration = 220L
                 interpolator = DecelerateInterpolator()
                 addUpdateListener { va ->
                     val fraction = va.animatedFraction
@@ -1356,6 +1664,17 @@ private class UserBeaconOverlay(
                 start()
             }
         }
+    }
+
+    fun clearLocation() {
+        animator?.cancel()
+        animator = null
+        displayLat = null
+        displayLng = null
+        targetLat = null
+        targetLng = null
+        bearing = null
+        mapView.postInvalidate()
     }
 
     override fun onSingleTapConfirmed(e: MotionEvent?, mapView: MapView?): Boolean {
@@ -1410,20 +1729,17 @@ private class UserBeaconOverlay(
             pCanvas.restore()
         }
 
-        // 2. Breathing / Pulsing Radar Halo
-        val now = SystemClock.uptimeMillis()
-        val pulseProgress = (now % 2200L) / 2200f
-        val haloRadius = (13f + pulseProgress * 20f) * density
-        val haloAlpha = ((1f - pulseProgress).coerceIn(0f, 1f) * 0.42f * 255).toInt()
-
-        haloPaint.color = Color.argb(haloAlpha, 56, 189, 248)
-        haloBorderPaint.color = Color.argb((haloAlpha * 1.5f).toInt().coerceAtMost(255), 56, 189, 248)
+        // 2. Halo (Subtle RouteWake radar glow without infinite invalidate loop)
+        val haloRadius = 18f * density
+        haloPaint.color = 0x2E38BDF8.toInt()
+        haloBorderPaint.color = 0x5538BDF8.toInt()
         haloBorderPaint.strokeWidth = 1.2f * density
 
         pCanvas.drawCircle(cx, cy, haloRadius, haloPaint)
         pCanvas.drawCircle(cx, cy, haloRadius, haloBorderPaint)
 
         // 3. Fresh-Fix Live Indicator (Active telemetry ring within 1.2s of new fix)
+        val now = SystemClock.uptimeMillis()
         if (now - lastFixTimeMs < 1200L) {
             freshFixPaint.color = 0x8838BDF8.toInt()
             freshFixPaint.strokeWidth = 2.2f * density
@@ -1442,8 +1758,32 @@ private class UserBeaconOverlay(
         // 7. Specular highlight point in center
         pCanvas.drawCircle(cx, cy, 2.5f * density, specularPaint)
 
-        // Maintain continuous pulse animation at ~25fps without blocking
-        pMapView.postInvalidateDelayed(40L)
+        // 8. Explicit Directional Pointer Arrow (prominently showing exact orientation)
+        if (isReliableBearing && bearing != null) {
+            pCanvas.save()
+            pCanvas.rotate(bearing!!, cx, cy)
+
+            pointerPath.reset()
+            // Tip pointing upward (towards bearing)
+            pointerPath.moveTo(cx, cy - 17f * density)
+            // Right outer fin
+            pointerPath.lineTo(cx + 7.5f * density, cy - 6f * density)
+            // Inner notch
+            pointerPath.lineTo(cx, cy - 9.5f * density)
+            // Left outer fin
+            pointerPath.lineTo(cx - 7.5f * density, cy - 6f * density)
+            pointerPath.close()
+
+            // Outer crisp white outline
+            pointerBorderPaint.strokeWidth = 2.4f * density
+            pCanvas.drawPath(pointerPath, pointerBorderPaint)
+
+            // Inner vibrant sky-blue fill
+            pointerFillPaint.color = 0xFF0284C7.toInt()
+            pCanvas.drawPath(pointerPath, pointerFillPaint)
+
+            pCanvas.restore()
+        }
     }
 
     fun release() {

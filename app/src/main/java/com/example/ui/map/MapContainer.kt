@@ -4,6 +4,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import com.example.data.local.MapCameraState
 import com.example.data.model.Destination
 import com.example.data.model.RoutePoint
 import com.example.data.model.TrafficData
@@ -26,6 +27,11 @@ fun MapContainer(
     routePoints: List<RoutePoint>,
     isSatellite: Boolean,
     modifier: Modifier = Modifier,
+    initialCameraState: MapCameraState? = null,
+    isFollowMode: Boolean = true,
+    onManualNavigation: ((lat: Double, lng: Double, zoom: Double) -> Unit)? = null,
+    onCameraChanged: ((lat: Double, lng: Double, zoom: Double) -> Unit)? = null,
+    onSaveCameraImmediate: ((lat: Double, lng: Double, zoom: Double) -> Unit)? = null,
     recenterTrigger: Int = 0,
     zoomInTrigger: Int = 0,
     zoomOutTrigger: Int = 0,
@@ -51,6 +57,11 @@ fun MapContainer(
             showAlarmRadius = showAlarmRadius,
             routePoints = routePoints,
             isSatellite = isSatellite,
+            initialCameraState = initialCameraState,
+            isFollowMode = isFollowMode,
+            onManualNavigation = onManualNavigation,
+            onCameraChanged = onCameraChanged,
+            onSaveCameraImmediate = onSaveCameraImmediate,
             recenterTrigger = recenterTrigger,
             zoomInTrigger = zoomInTrigger,
             zoomOutTrigger = zoomOutTrigger,

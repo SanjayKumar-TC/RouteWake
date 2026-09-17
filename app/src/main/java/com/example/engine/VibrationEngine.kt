@@ -6,6 +6,7 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import kotlinx.coroutines.*
+import java.util.concurrent.CopyOnWriteArraySet
 
 class VibrationEngine(private val context: Context) {
     private var vibratorJob: Job? = null
@@ -24,9 +25,37 @@ class VibrationEngine(private val context: Context) {
         }
     }
 
+    private val vibratorManager: VibratorManager? by lazy {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+        } else null
+    }
+
+    companion object {
+        private val activeEngines = CopyOnWriteArraySet<VibrationEngine>()
+
+        fun stopAll(context: Context) {
+            activeEngines.forEach { engine ->
+                try {
+                    engine.stopVibration()
+                } catch (_: Exception) {}
+            }
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    val manager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+                    manager?.cancel()
+                    manager?.defaultVibrator?.cancel()
+                }
+                val v = context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+                v?.cancel()
+            } catch (_: Exception) {}
+        }
+    }
+
     fun startArrivalVibration() {
         if (isVibrating) return
         isVibrating = true
+        activeEngines.add(this)
 
         vibratorJob = scope.launch {
             val timings = longArrayOf(0, 400, 150, 400, 150, 800)
@@ -52,10 +81,15 @@ class VibrationEngine(private val context: Context) {
 
     fun stopVibration() {
         isVibrating = false
-        vibratorJob?.cancel()
+        val job = vibratorJob
         vibratorJob = null
+        job?.cancel()
         try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                vibratorManager?.cancel()
+            }
             vibrator?.cancel()
         } catch (_: Exception) {}
+        activeEngines.remove(this)
     }
 }

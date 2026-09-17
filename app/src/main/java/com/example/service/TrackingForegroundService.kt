@@ -26,6 +26,7 @@ import com.example.engine.ArrivalEngine
 import com.example.engine.GpsEngine
 import com.example.engine.VibrationEngine
 import com.example.network.RoutingService
+import com.example.worker.ArrivalWorkScheduler
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -86,6 +87,7 @@ class TrackingForegroundService : Service() {
         }
 
         arrivalEngine.onArrivalTriggered = { destination, distance ->
+            gpsEngine.stopSimulation()
             showArrivalNotification(destination, distance)
         }
     }
@@ -143,14 +145,17 @@ class TrackingForegroundService : Service() {
                 stopTrackingInternal()
             }
             ACTION_DISMISS_ALARM -> {
-                Log.d(TAG, "Dismiss alarm requested via action")
-                arrivalEngine.dismiss(_distanceRemaining.value)
-                stopTrackingInternal()
+                dismissAlarm()
             }
             ACTION_SNOOZE_ALARM -> {
-                Log.d(TAG, "Snooze alarm requested via action")
+                snoozeAlarm()
+            }
+            ACTION_ARRIVAL_FROM_WORKER -> {
+                Log.d(TAG, "Arrival signaled from WorkManager background worker")
                 val settings = userPreferences.getSettings()
-                arrivalEngine.snooze(60, settings.alarmTone, settings.vibrationEnabled)
+                if (arrivalEngine.tripState.value == TripState.TRACKING || arrivalEngine.tripState.value == TripState.WARMUP) {
+                    arrivalEngine.evaluateDistance(0.0, settings.alarmTone, settings.vibrationEnabled)
+                }
             }
         }
 
@@ -170,6 +175,8 @@ class TrackingForegroundService : Service() {
         val hasActiveTrip = userPreferences.hasActiveTrip() || arrivalEngine.tripState.value != TripState.IDLE
         if (hasActiveTrip) {
             acquireWakeLock()
+            // Schedule WorkManager arrival check as guaranteed background safety net
+            ArrivalWorkScheduler.scheduleArrivalDetection(this, initialDelaySeconds = 15L)
 
             // Update notification to reassure user that background GPS tracking remains active
             val dest = arrivalEngine.getActiveDestination()
@@ -242,6 +249,9 @@ class TrackingForegroundService : Service() {
         } else 5000.0
 
         arrivalEngine.startTrip(destination, radiusMeters, transport, initialDist)
+
+        // Schedule WorkManager arrival detection worker as auxiliary battery-efficient background monitor
+        ArrivalWorkScheduler.scheduleArrivalDetection(this, initialDelaySeconds = 60L)
     }
 
     private fun handleLocationUpdate(location: Location) {
@@ -356,13 +366,42 @@ class TrackingForegroundService : Service() {
         notificationManager.notify(NOTIFICATION_ID, arrivalNotification)
     }
 
+    fun dismissAlarm() {
+        Log.d(TAG, "dismissAlarm: Dismissing active arrival alarm")
+        arrivalEngine.dismiss(_distanceRemaining.value)
+        stopTrackingInternal()
+    }
+
+    fun snoozeAlarm() {
+        Log.d(TAG, "snoozeAlarm: Snoozing arrival alarm for 60 seconds")
+        audioEngine.stopAlarm()
+        AlarmAudioEngine.stopAll()
+        vibrationEngine.stopVibration()
+        VibrationEngine.stopAll(this)
+        val settings = userPreferences.getSettings()
+        arrivalEngine.snooze(60, settings.alarmTone, settings.vibrationEnabled)
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        notificationManager?.cancel(NOTIFICATION_ID)
+        notificationManager?.cancel(ArrivalNotificationHelper.NOTIFICATION_ID_ARRIVAL)
+        ArrivalNotificationHelper.dismissArrivalNotification(this)
+    }
+
     private fun stopTrackingInternal() {
         Log.d(TAG, "stopTrackingInternal: Cleaning up tracking service state")
         userPreferences.clearActiveTrip()
+        ArrivalWorkScheduler.cancelArrivalDetection(this)
         gpsEngine.stopTracking()
         gpsEngine.stopSimulation()
         audioEngine.stopAlarm()
+        AlarmAudioEngine.stopAll()
         vibrationEngine.stopVibration()
+        VibrationEngine.stopAll(this)
+
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        notificationManager?.cancel(NOTIFICATION_ID)
+        notificationManager?.cancel(ArrivalNotificationHelper.NOTIFICATION_ID_ARRIVAL)
+        notificationManager?.cancelAll()
+        ArrivalNotificationHelper.dismissArrivalNotification(this)
 
         releaseWakeLock()
 
@@ -452,6 +491,7 @@ class TrackingForegroundService : Service() {
         const val ACTION_STOP_TRACKING = "com.routewake.ACTION_STOP"
         const val ACTION_DISMISS_ALARM = "com.routewake.ACTION_DISMISS"
         const val ACTION_SNOOZE_ALARM = "com.routewake.ACTION_SNOOZE"
+        const val ACTION_ARRIVAL_FROM_WORKER = "com.routewake.ACTION_ARRIVAL_FROM_WORKER"
 
         const val EXTRA_DEST_NAME = "extra_dest_name"
         const val EXTRA_DEST_ADDRESS = "extra_dest_address"

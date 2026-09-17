@@ -1,7 +1,9 @@
 package com.example.engine
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.pm.PackageManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -10,6 +12,8 @@ import android.os.Bundle
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import androidx.core.content.ContextCompat
+import androidx.core.location.LocationManagerCompat
 import com.example.data.model.GpsQuality
 import com.example.network.RoutingService
 import com.google.android.gms.location.*
@@ -95,7 +99,158 @@ class GpsEngine private constructor(private val context: Context) {
     }
 
     @SuppressLint("MissingPermission")
+    fun fetchImmediateLocation() {
+        if (!hasLocationPermission() || !isLocationEnabled()) return
+
+        val cachedCandidates = mutableListOf<Location>()
+
+        try {
+            val gpsLoc = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+            if (gpsLoc != null) cachedCandidates.add(gpsLoc)
+        } catch (_: Throwable) {}
+
+        try {
+            val netLoc = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+            if (netLoc != null) cachedCandidates.add(netLoc)
+        } catch (_: Throwable) {}
+
+        try {
+            val passiveLoc = locationManager.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER)
+            if (passiveLoc != null) cachedCandidates.add(passiveLoc)
+        } catch (_: Throwable) {}
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            try {
+                val fusedLoc = locationManager.getLastKnownLocation(LocationManager.FUSED_PROVIDER)
+                if (fusedLoc != null) cachedCandidates.add(fusedLoc)
+            } catch (_: Throwable) {}
+        }
+
+        // Immediately seed current location if null
+        val bestCached = selectBestLocation(cachedCandidates)
+        if (bestCached != null && _currentLocation.value == null) {
+            Log.d(TAG, "Seeding initial location from system cache: ${bestCached.latitude}, ${bestCached.longitude}")
+            applyInitialLocation(bestCached, "system_cache_seed")
+        }
+
+        // Asynchronously check Google Play Services Fused Location
+        try {
+            fusedClient.lastLocation.addOnSuccessListener { lastLoc ->
+                if (lastLoc != null) {
+                    if (_currentLocation.value == null) {
+                        Log.d(TAG, "Seeding initial location from fused lastLocation: ${lastLoc.latitude}, ${lastLoc.longitude}")
+                        applyInitialLocation(lastLoc, "fused_lastLocation")
+                    } else if (isBetterLocation(lastLoc, _currentLocation.value)) {
+                        processRawLocation(lastLoc, "fused_lastLocation_upgrade")
+                    }
+                }
+            }.addOnFailureListener { e ->
+                Log.d(TAG, "fusedClient.lastLocation error: ${e.message}")
+            }
+        } catch (t: Throwable) {
+            Log.d(TAG, "fusedClient.lastLocation exception: ${t.message}")
+        }
+
+        // Direct hardware single-shot query via getCurrentLocation
+        try {
+            fusedClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
+                .addOnSuccessListener { freshLoc ->
+                    if (freshLoc != null) {
+                        Log.d(TAG, "fusedClient.getCurrentLocation resolved: ${freshLoc.latitude}, ${freshLoc.longitude}")
+                        processRawLocation(freshLoc, "fused_getCurrentLocation")
+                    }
+                }
+                .addOnFailureListener { e ->
+                    Log.d(TAG, "fusedClient.getCurrentLocation failed: ${e.message}")
+                }
+        } catch (t: Throwable) {
+            Log.d(TAG, "fusedClient.getCurrentLocation exception: ${t.message}")
+        }
+    }
+
+    fun hasLocationPermission(): Boolean {
+        val fine = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        val coarse = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        return fine || coarse
+    }
+
+    private fun applyInitialLocation(location: Location, source: String) {
+        val fixNanos = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
+            location.elapsedRealtimeNanos
+        } else {
+            location.time * 1_000_000L
+        }
+        lastAcceptedFixRealtimeNanos = fixNanos
+        val accuracy = if (location.hasAccuracy()) location.accuracy else 35f
+        val ageSec = getLocationAgeSeconds(location)
+        _gpsQuality.value = GpsQuality.fromAccuracy(accuracy, ageSec.toLong(), isAvailable = true)
+        _currentLocation.value = location
+        Log.d(TAG, "GPS_INITIAL accepted: lat=${location.latitude}, lng=${location.longitude}, acc=${accuracy}m, source=$source")
+        onLocationUpdated?.invoke(location)
+    }
+
+    private fun selectBestLocation(locations: List<Location>): Location? {
+        if (locations.isEmpty()) return null
+        return locations.minWithOrNull { a, b ->
+            val ageA = getLocationAgeSeconds(a)
+            val ageB = getLocationAgeSeconds(b)
+            if (Math.abs(ageA - ageB) > 60.0) {
+                ageA.compareTo(ageB)
+            } else {
+                val accA = if (a.hasAccuracy()) a.accuracy else 200f
+                val accB = if (b.hasAccuracy()) b.accuracy else 200f
+                accA.compareTo(accB)
+            }
+        }
+    }
+
+    private fun isBetterLocation(candidate: Location, current: Location?): Boolean {
+        if (current == null) return true
+        val timeDeltaNanos = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
+            candidate.elapsedRealtimeNanos - current.elapsedRealtimeNanos
+        } else {
+            (candidate.time - current.time) * 1_000_000L
+        }
+        val isSignificantlyNewer = timeDeltaNanos > 60_000_000_000L
+        val isSignificantlyOlder = timeDeltaNanos < -60_000_000_000L
+        val isNewer = timeDeltaNanos > 0
+
+        if (isSignificantlyNewer) return true
+        if (isSignificantlyOlder) return false
+
+        val accuracyDelta = candidate.accuracy - current.accuracy
+        val isLessAccurate = accuracyDelta > 0
+        val isMoreAccurate = accuracyDelta < 0
+
+        return when {
+            isMoreAccurate -> true
+            isNewer && !isLessAccurate -> true
+            else -> false
+        }
+    }
+
+    @SuppressLint("MissingPermission")
     fun startTracking() {
+        if (!hasLocationPermission()) {
+            Log.d(TAG, "startTracking: location permission not granted yet")
+            return
+        }
+        if (!isLocationEnabled()) {
+            Log.d(TAG, "startTracking: device Location service is disabled. Aborting.")
+            _gpsQuality.value = GpsQuality.OFF
+            _currentLocation.value = null
+            return
+        }
+
+        // Immediately fetch cached & active location so map displays current position right away
+        fetchImmediateLocation()
+
         if (isSubscribed) return
         isSubscribed = true
         Log.d(TAG, "startTracking: starting location subscriptions (interval=${currentIntervalMs}ms)")
@@ -103,7 +258,6 @@ class GpsEngine private constructor(private val context: Context) {
         startStaleMonitor()
         checkProviderStatus()
 
-        var fusedRegistered = false
         try {
             val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, currentIntervalMs)
                 .setMinUpdateIntervalMillis(minOf(1000L, currentIntervalMs / 2))
@@ -113,48 +267,18 @@ class GpsEngine private constructor(private val context: Context) {
 
             fusedClient.requestLocationUpdates(request, fusedCallback, Looper.getMainLooper())
                 .addOnSuccessListener {
-                    fusedRegistered = true
                     isUsingFused = true
                     Log.d(TAG, "FusedLocationProviderClient connected successfully")
                 }
                 .addOnFailureListener { e ->
-                    Log.w(TAG, "FusedLocationProviderClient failed to register: ${e.message}, falling back to LocationManager")
-                    registerLocationManagerFallback()
+                    Log.w(TAG, "FusedLocationProviderClient failed to register: ${e.message}")
                 }
-
-            // Immediately query last location for rapid UI populating
-            fusedClient.lastLocation.addOnSuccessListener { lastLoc ->
-                if (lastLoc != null) {
-                    val ageSec = getLocationAgeSeconds(lastLoc)
-                    if (ageSec <= 15.0) {
-                        Log.d(TAG, "Fused lastLocation is fresh (${ageSec}s old), accepting immediately")
-                        processRawLocation(lastLoc, "fused_cached_fresh")
-                    } else {
-                        Log.d(TAG, "Fused lastLocation is stale (${ageSec}s old), waiting for live fix")
-                    }
-                }
-            }
         } catch (e: Throwable) {
-            Log.w(TAG, "FusedLocationProviderClient exception: ${e.message}, using LocationManager fallback")
-            registerLocationManagerFallback()
+            Log.w(TAG, "FusedLocationProviderClient exception: ${e.message}")
         }
 
-        // Always also check LocationManager last known location if we don't have a fix yet
-        if (_currentLocation.value == null) {
-            try {
-                val gpsLoc = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-                val netLoc = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-                val best = when {
-                    gpsLoc == null -> netLoc
-                    netLoc == null -> gpsLoc
-                    getLocationAgeSeconds(gpsLoc) < getLocationAgeSeconds(netLoc) -> gpsLoc
-                    else -> netLoc
-                }
-                if (best != null && getLocationAgeSeconds(best) <= 15.0) {
-                    processRawLocation(best, "lm_cached_fresh")
-                }
-            } catch (_: SecurityException) {}
-        }
+        // Also register LocationManager listeners in parallel to catch fast hardware/network updates
+        registerLocationManagerFallback()
     }
 
     @SuppressLint("MissingPermission")
@@ -205,12 +329,17 @@ class GpsEngine private constructor(private val context: Context) {
         } catch (_: Throwable) {}
     }
 
+    fun clearLocation() {
+        _currentLocation.value = null
+        _gpsQuality.value = GpsQuality.OFF
+    }
+
     fun startWarmup(onComplete: () -> Unit) {
         warmupJob?.cancel()
-        _warmupSecondsRemaining.value = 10
+        _warmupSecondsRemaining.value = WARMUP_DURATION_SECONDS
 
         warmupJob = scope.launch {
-            for (sec in 10 downTo 1) {
+            for (sec in WARMUP_DURATION_SECONDS downTo 1) {
                 _warmupSecondsRemaining.value = sec
                 delay(1000L)
             }
@@ -283,6 +412,12 @@ class GpsEngine private constructor(private val context: Context) {
         // 2. Freshness check using elapsed realtime monotonic clock
         val ageSec = getLocationAgeSeconds(location)
         if (ageSec > 20.0) {
+            // If current location is null, seed UI immediately with this location
+            if (_currentLocation.value == null) {
+                Log.d(TAG, "Accepting initial fix with age ${ageSec}s from $source to initialize UI")
+                applyInitialLocation(location, source)
+                return
+            }
             Log.d(TAG, "GPS_FIX rejected: stale fix age=${String.format(Locale.US, "%.1f", ageSec)}s source=$source")
             return
         }
@@ -341,11 +476,19 @@ class GpsEngine private constructor(private val context: Context) {
     }
 
     private fun checkProviderStatus() {
-        val hasGps = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
-        val hasNetwork = locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
-        if (!hasGps && !hasNetwork) {
+        val isLocEnabled = isLocationEnabled()
+        if (!isLocEnabled) {
             _gpsQuality.value = GpsQuality.OFF
+            _currentLocation.value = null
         }
+    }
+
+    fun isLocationEnabled(): Boolean {
+        return LocationManagerCompat.isLocationEnabled(locationManager)
+    }
+
+    fun isHighAccuracyAvailable(): Boolean {
+        return isLocationEnabled() && locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
     }
 
     private fun isAnyLocationProviderAvailable(): Boolean {
@@ -440,6 +583,7 @@ class GpsEngine private constructor(private val context: Context) {
 
     companion object {
         private const val TAG = "RouteWakeGps"
+        const val WARMUP_DURATION_SECONDS = 3
 
         @Volatile
         private var INSTANCE: GpsEngine? = null

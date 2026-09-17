@@ -5,6 +5,7 @@ import android.media.AudioFormat
 import android.media.AudioTrack
 import com.example.data.model.AlarmTone
 import kotlinx.coroutines.*
+import java.util.concurrent.CopyOnWriteArraySet
 import kotlin.math.sin
 
 class AlarmAudioEngine {
@@ -14,9 +15,25 @@ class AlarmAudioEngine {
     @Volatile
     private var isPlaying = false
 
+    @Volatile
+    private var currentAudioTrack: AudioTrack? = null
+
+    companion object {
+        private val activeEngines = CopyOnWriteArraySet<AlarmAudioEngine>()
+
+        fun stopAll() {
+            activeEngines.forEach { engine ->
+                try {
+                    engine.stopAlarm()
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
     fun startAlarm(tone: AlarmTone) {
         if (isPlaying) return
         isPlaying = true
+        activeEngines.add(this)
 
         audioJob = scope.launch {
             val sampleRate = 44100
@@ -46,8 +63,11 @@ class AlarmAudioEngine {
                     .build()
             } catch (_: Exception) {
                 isPlaying = false
+                activeEngines.remove(this@AlarmAudioEngine)
                 return@launch
             }
+
+            currentAudioTrack = audioTrack
 
             try {
                 audioTrack.play()
@@ -75,8 +95,10 @@ class AlarmAudioEngine {
                             AlarmTone.SIREN -> {
                                 700.0 + 400.0 * (0.5 + 0.5 * sin(2.0 * Math.PI * cycleSeconds * 1.5))
                             }
+                            AlarmTone.INTUITION -> {
+                                if (cycleSeconds < 0.75) 852.0 else 0.0
+                            }
                             else -> {
-                                // Specific Solfeggio frequency (396Hz, 528Hz, etc.)
                                 if (cycleSeconds < 0.75) tone.frequencyHz.toDouble() else 0.0
                             }
                         }
@@ -92,22 +114,42 @@ class AlarmAudioEngine {
                         }
                     }
 
-                    audioTrack.write(shortBuffer, 0, shortBuffer.size)
+                    if (!isActive || !isPlaying) break
+                    val written = audioTrack.write(shortBuffer, 0, shortBuffer.size)
+                    if (written < 0) break
                 }
             } catch (_: Exception) {
             } finally {
                 try {
+                    audioTrack.pause()
+                    audioTrack.flush()
                     audioTrack.stop()
                     audioTrack.release()
                 } catch (_: Exception) {}
+                if (currentAudioTrack === audioTrack) {
+                    currentAudioTrack = null
+                }
+                isPlaying = false
+                activeEngines.remove(this@AlarmAudioEngine)
             }
         }
     }
 
     fun stopAlarm() {
         isPlaying = false
-        audioJob?.cancel()
+        val job = audioJob
         audioJob = null
+        job?.cancel()
+
+        val track = currentAudioTrack
+        currentAudioTrack = null
+        try {
+            track?.pause()
+            track?.flush()
+            track?.stop()
+            track?.release()
+        } catch (_: Exception) {}
+        activeEngines.remove(this)
     }
 
     fun isAlarmActive(): Boolean = isPlaying

@@ -28,9 +28,9 @@ fun SettingsSheet(
     onUpdateEcoMode: (Boolean) -> Unit,
     onUpdateAlarmTone: (AlarmTone) -> Unit,
     onUpdateVibration: (Boolean) -> Unit,
-    onUpdateDefaultRadius: (Int) -> Unit,
+    onDefaultRadiusChange: (Int) -> Unit = {},
+    onUpdateDefaultRadius: (Int) -> Unit = onDefaultRadiusChange,
     onUpdateSatellite: (Boolean) -> Unit,
-    onUpdateTrafficEnabled: (Boolean) -> Unit = {},
     onTestAlarmSound: (AlarmTone) -> Unit
 ) {
     var isTestingSound by remember { mutableStateOf(false) }
@@ -67,7 +67,7 @@ fun SettingsSheet(
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Eco Mode", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
                             Text(
-                                "Adaptive GPS interval when far (>10km: 35s, near: 1.5s) to save battery without sacrificing arrival accuracy.",
+                                "Saves battery using adaptive GPS intervals.",
                                 fontSize = 12.sp,
                                 color = TextSecondary
                             )
@@ -148,10 +148,13 @@ fun SettingsSheet(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Arrival Vibration", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
-                            Text("400ms-150ms-400ms-150ms-800ms rhythmic alert", fontSize = 12.sp, color = TextSecondary)
-                        }
+                        Text(
+                            text = "Arrival Vibration",
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = TextPrimary,
+                            modifier = Modifier.weight(1f)
+                        )
                         Switch(
                             checked = settings.vibrationEnabled,
                             onCheckedChange = onUpdateVibration
@@ -192,25 +195,6 @@ fun SettingsSheet(
                         Switch(
                             checked = settings.satelliteMap,
                             onCheckedChange = onUpdateSatellite
-                        )
-                    }
-                    HorizontalDivider(
-                        modifier = Modifier.padding(vertical = 12.dp),
-                        color = BorderSubtle
-                    )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Traffic & Incidents Layer", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
-                            Text("Color-coded route congestion and incident markers", fontSize = 12.sp, color = TextSecondary)
-                        }
-                        Switch(
-                            checked = settings.trafficEnabled,
-                            onCheckedChange = onUpdateTrafficEnabled,
-                            modifier = Modifier.testTag("setting_traffic_switch")
                         )
                     }
                 }

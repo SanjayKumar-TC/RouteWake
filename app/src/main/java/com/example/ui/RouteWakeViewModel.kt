@@ -2,6 +2,7 @@ package com.example.ui
 
 import android.Manifest
 import android.app.Application
+import android.app.NotificationManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -17,15 +18,22 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.RouteWakeApp
 import com.example.data.local.FavoriteEntity
+import com.example.data.local.MapCameraState
 import com.example.data.local.TripHistoryEntity
 import com.example.data.local.UserPreferences
 import com.example.data.model.*
 import com.example.engine.AlarmAudioEngine
+import com.example.engine.CompassSensorManager
 import com.example.engine.GpsEngine
+import com.example.engine.LocationPrerequisiteManager
+import com.example.engine.LocationPrerequisiteState
+import com.example.engine.VibrationEngine
 import com.example.network.GeocodingService
 import com.example.network.RoutingService
+import com.example.service.ArrivalNotificationHelper
 import com.example.service.TrackingForegroundService
 import com.example.ui.components.NavTab
+import com.example.worker.ArrivalWorkScheduler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -41,6 +49,7 @@ class RouteWakeViewModel(application: Application) : AndroidViewModel(applicatio
     private val routingService = RoutingService()
     private val testAudioEngine = AlarmAudioEngine()
     private val gpsEngine = GpsEngine.getInstance(application)
+    private val compassSensorManager = CompassSensorManager(application)
 
     val settings = userPreferences.settingsFlow
     val favorites: StateFlow<List<FavoriteEntity>> = db.favoriteDao().getAllFavorites()
@@ -78,6 +87,13 @@ class RouteWakeViewModel(application: Application) : AndroidViewModel(applicatio
     private val _currentLocation = MutableStateFlow<Location?>(null)
     val currentLocation: StateFlow<Location?> = _currentLocation.asStateFlow()
 
+    // Real-time device heading/compass orientation (0..360 degrees)
+    val deviceHeading: StateFlow<Float?> = compassSensorManager.headingFlow
+
+    // Location prerequisites state (Device Location ON, Permissions, High Accuracy)
+    private val _prerequisiteState = MutableStateFlow<LocationPrerequisiteState>(LocationPrerequisiteState.Checking)
+    val prerequisiteState: StateFlow<LocationPrerequisiteState> = _prerequisiteState.asStateFlow()
+
     private val _completedTripSummary = MutableStateFlow<TripHistoryEntity?>(null)
     val completedTripSummary: StateFlow<TripHistoryEntity?> = _completedTripSummary.asStateFlow()
 
@@ -93,6 +109,107 @@ class RouteWakeViewModel(application: Application) : AndroidViewModel(applicatio
 
     private val _recentSearches = MutableStateFlow(userPreferences.getRecentSearches())
     val recentSearches: StateFlow<List<String>> = _recentSearches.asStateFlow()
+
+    // Follow Mode & Map Camera State
+    private val _isFollowMode = MutableStateFlow(true)
+    val isFollowMode: StateFlow<Boolean> = _isFollowMode.asStateFlow()
+
+    private val _recenterTrigger = MutableStateFlow(0)
+    val recenterTrigger: StateFlow<Int> = _recenterTrigger.asStateFlow()
+
+    /**
+     * Checks if device location services and runtime location permissions are active.
+     */
+    fun isLocationServicesActive(): Boolean {
+        val context = getApplication<Application>()
+        val isEnabled = LocationPrerequisiteManager.isLocationEnabled(context)
+        val hasFine = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        val hasCoarse = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        return isEnabled && (hasFine || hasCoarse)
+    }
+
+    /**
+     * Initiates 'Follow Mode'.
+     * Strictly centers the map on the user's current GPS location when activated,
+     * while preserving manual navigation persistence in userPreferences when not in follow mode.
+     */
+    fun initiateFollowMode(forceRecenter: Boolean = true) {
+        _isFollowMode.value = true
+        if (forceRecenter) {
+            _recenterTrigger.value++
+        }
+        if (isLocationServicesActive()) {
+            val loc = _currentLocation.value
+            if (loc != null) {
+                // Strictly center on current GPS location
+                _metrics.value = _metrics.value.copy(
+                    currentLat = loc.latitude,
+                    currentLng = loc.longitude
+                )
+            } else {
+                // Location services active but awaiting fix; start tracking to strictly center on fix
+                gpsEngine.startTracking()
+                refreshCurrentLocation()
+            }
+        }
+        // Manual navigation persistence in userPreferences is strictly preserved and not overwritten.
+    }
+
+    /**
+     * Activates 'Follow Mode', strictly centering on current GPS location.
+     */
+    fun activateFollowMode() {
+        initiateFollowMode(forceRecenter = true)
+    }
+
+    /**
+     * Called when manual navigation (panning, scrolling, zooming) occurs on the map.
+     * Disengages Follow Mode so user manual exploration is respected, and persists the
+     * manual camera position to storage.
+     */
+    fun onManualMapNavigation(lat: Double, lng: Double, zoom: Double) {
+        _isFollowMode.value = false
+        userPreferences.saveMapCameraState(lat, lng, zoom)
+    }
+
+    fun setFollowMode(enabled: Boolean) {
+        if (enabled) {
+            initiateFollowMode(forceRecenter = true)
+        } else {
+            _isFollowMode.value = false
+        }
+    }
+
+    fun getSavedMapCameraState(): MapCameraState? = userPreferences.getMapCameraState()
+
+    fun saveMapCameraState(lat: Double, lng: Double, zoom: Double) {
+        userPreferences.saveMapCameraState(lat, lng, zoom)
+    }
+
+    fun clearSavedMapCameraState() {
+        userPreferences.clearMapCameraState()
+    }
+
+    /**
+     * Resolves the camera state for map initialization:
+     * - If Follow Mode is active and location services are active with a current GPS fix,
+     *   strictly centers on the user's current GPS coordinate.
+     * - When not in follow mode, preserves and restores the persisted manual navigation camera state.
+     */
+    fun getInitialCameraState(): MapCameraState? {
+        val loc = _currentLocation.value
+        return if (_isFollowMode.value && isLocationServicesActive() && loc != null) {
+            MapCameraState(loc.latitude, loc.longitude, 16.0)
+        } else {
+            userPreferences.getMapCameraState()
+        }
+    }
 
     private var searchJob: Job? = null
     private var routeCalculationJob: Job? = null
@@ -118,6 +235,7 @@ class RouteWakeViewModel(application: Application) : AndroidViewModel(applicatio
                 trackingService?.currentLocation?.collect { loc ->
                     if (loc != null) {
                         _currentLocation.value = loc
+                        geocodingService.warmupLocationContext(loc.latitude, loc.longitude)
                     }
                 }
             }
@@ -190,7 +308,13 @@ class RouteWakeViewModel(application: Application) : AndroidViewModel(applicatio
                     )
                     if (prev == null) {
                         recalculateRouteIfDestinationSelected()
+                        if (_isFollowMode.value && isLocationServicesActive()) {
+                            _recenterTrigger.value++
+                        }
                     }
+                    geocodingService.warmupLocationContext(loc.latitude, loc.longitude)
+                } else {
+                    _currentLocation.value = null
                 }
             }
         }
@@ -208,23 +332,69 @@ class RouteWakeViewModel(application: Application) : AndroidViewModel(applicatio
             }
         }
 
-        refreshCurrentLocation()
+        compassSensorManager.start()
+        val appContext = getApplication<Application>()
+        if (LocationPrerequisiteManager.hasAnyLocationPermission(appContext) && LocationPrerequisiteManager.isLocationEnabled(appContext)) {
+            gpsEngine.startTracking()
+            gpsEngine.fetchImmediateLocation()
+        }
+        checkPrerequisites()
+    }
+
+    fun startCompass() {
+        compassSensorManager.start()
+    }
+
+    fun stopCompass() {
+        compassSensorManager.stop()
+    }
+
+    /**
+     * Checks all device location prerequisites in proper sequence:
+     * 1. Device Location service (Master toggle)
+     * 2. Runtime location permissions (FINE / COARSE)
+     * 3. High accuracy location settings (Google Play Services SettingsClient)
+     */
+    fun checkPrerequisites() {
+        val context = getApplication<Application>()
+        LocationPrerequisiteManager.checkPrerequisites(context) { state ->
+            _prerequisiteState.value = state
+            when (state) {
+                is LocationPrerequisiteState.Satisfied -> {
+                    gpsEngine.startTracking()
+                }
+                is LocationPrerequisiteState.HighAccuracyDisabled -> {
+                    gpsEngine.startTracking()
+                    _metrics.value = _metrics.value.copy(
+                        gpsQuality = GpsQuality.POOR
+                    )
+                }
+                is LocationPrerequisiteState.LocationDisabled -> {
+                    gpsEngine.stopTracking()
+                    gpsEngine.clearLocation()
+                    _currentLocation.value = null
+                    _metrics.value = _metrics.value.copy(
+                        gpsQuality = GpsQuality.OFF,
+                        currentSpeedKmh = 0.0
+                    )
+                }
+                is LocationPrerequisiteState.PermissionRequired -> {
+                    gpsEngine.stopTracking()
+                    gpsEngine.clearLocation()
+                    _currentLocation.value = null
+                    _metrics.value = _metrics.value.copy(
+                        gpsQuality = GpsQuality.OFF,
+                        currentSpeedKmh = 0.0
+                    )
+                }
+                LocationPrerequisiteState.Checking -> {}
+            }
+        }
     }
 
     fun refreshCurrentLocation() {
-        val context = getApplication<Application>()
-        val hasFine = ContextCompat.checkSelfPermission(
-            context,
-            Manifest.permission.ACCESS_FINE_LOCATION
-        ) == PackageManager.PERMISSION_GRANTED
-        val hasCoarse = ContextCompat.checkSelfPermission(
-            context,
-            Manifest.permission.ACCESS_COARSE_LOCATION
-        ) == PackageManager.PERMISSION_GRANTED
-
-        if (hasFine || hasCoarse) {
-            gpsEngine.startTracking()
-        }
+        gpsEngine.fetchImmediateLocation()
+        checkPrerequisites()
     }
 
     private fun recalculateRouteIfDestinationSelected() {
@@ -286,37 +456,63 @@ class RouteWakeViewModel(application: Application) : AndroidViewModel(applicatio
         _activeTab.value = null
     }
 
-    // Search with ~350ms debounce
+    private var activeSearchRequestId: Long = 0L
+
+    // Search with ~300ms debounce and strict generation ID protection
     fun onSearchQueryChanged(query: String) {
         _searchQuery.value = query
+        val requestId = ++activeSearchRequestId
         searchJob?.cancel()
 
-        if (query.trim().length < 2) {
+        val trimmed = query.trim()
+        if (trimmed.length < 2) {
             _searchResults.value = emptyList()
             _isSearching.value = false
             return
         }
 
         searchJob = viewModelScope.launch {
-            delay(350L) // 350ms debounce
+            delay(300L) // 300ms debounce
+            if (requestId != activeSearchRequestId || _searchQuery.value.trim() != trimmed) {
+                return@launch
+            }
             _isSearching.value = true
-            val results = geocodingService.searchDestinations(query)
-            _searchResults.value = results
-            _isSearching.value = false
+            try {
+                val curLoc = _currentLocation.value
+                val results = geocodingService.searchDestinations(trimmed, curLoc?.latitude, curLoc?.longitude)
+                if (requestId == activeSearchRequestId && _searchQuery.value.trim() == trimmed) {
+                    _searchResults.value = results
+                }
+            } finally {
+                if (requestId == activeSearchRequestId) {
+                    _isSearching.value = false
+                }
+            }
         }
     }
 
     fun onSearchSubmitted(query: String) {
-        if (query.trim().isEmpty()) return
-        userPreferences.addRecentSearch(query)
+        val trimmed = query.trim()
+        if (trimmed.isEmpty()) return
+        userPreferences.addRecentSearch(trimmed)
         _recentSearches.value = userPreferences.getRecentSearches()
 
+        val requestId = ++activeSearchRequestId
         searchJob?.cancel()
         searchJob = viewModelScope.launch {
+            if (requestId != activeSearchRequestId) return@launch
             _isSearching.value = true
-            val results = geocodingService.searchDestinations(query)
-            _searchResults.value = results
-            _isSearching.value = false
+            try {
+                val curLoc = _currentLocation.value
+                val results = geocodingService.searchDestinations(trimmed, curLoc?.latitude, curLoc?.longitude)
+                if (requestId == activeSearchRequestId && _searchQuery.value.trim() == trimmed) {
+                    _searchResults.value = results
+                }
+            } finally {
+                if (requestId == activeSearchRequestId) {
+                    _isSearching.value = false
+                }
+            }
         }
     }
 
@@ -484,6 +680,11 @@ class RouteWakeViewModel(application: Application) : AndroidViewModel(applicatio
         val dest = _selectedDestination.value ?: return false
         val context = getApplication<Application>()
 
+        if (!LocationPrerequisiteManager.isLocationEnabled(context)) {
+            checkPrerequisites()
+            return false
+        }
+
         val hasFine = ContextCompat.checkSelfPermission(
             context,
             Manifest.permission.ACCESS_FINE_LOCATION
@@ -495,6 +696,7 @@ class RouteWakeViewModel(application: Application) : AndroidViewModel(applicatio
         ) == PackageManager.PERMISSION_GRANTED
 
         if (!hasFine && !hasCoarse) {
+            checkPrerequisites()
             return false
         }
 
@@ -512,8 +714,11 @@ class RouteWakeViewModel(application: Application) : AndroidViewModel(applicatio
             context.startForegroundService(intent)
             context.bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
 
+            ArrivalWorkScheduler.scheduleArrivalDetection(context, initialDelaySeconds = 60L)
+
             _tripState.value = TripState.WARMUP
             _activeTab.value = null // Close sheet so user sees map and cockpit overlay
+            initiateFollowMode(forceRecenter = true)
             return true
         } catch (e: Exception) {
             android.util.Log.e("RouteWakeViewModel", "Failed to start tracking service: ${e.message}", e)
@@ -523,10 +728,24 @@ class RouteWakeViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun stopTrip() {
         val context = getApplication<Application>()
+        AlarmAudioEngine.stopAll()
+        VibrationEngine.stopAll(context)
+        testAudioEngine.stopAlarm()
+
+        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        notificationManager?.cancel(TrackingForegroundService.NOTIFICATION_ID)
+        notificationManager?.cancel(ArrivalNotificationHelper.NOTIFICATION_ID_ARRIVAL)
+        notificationManager?.cancelAll()
+        ArrivalNotificationHelper.dismissArrivalNotification(context)
+
+        ArrivalWorkScheduler.cancelArrivalDetection(context)
+
         val intent = Intent(context, TrackingForegroundService::class.java).apply {
             action = TrackingForegroundService.ACTION_STOP_TRACKING
         }
-        context.startService(intent)
+        try {
+            context.startService(intent)
+        } catch (_: Exception) {}
 
         if (isBound) {
             try {
@@ -541,18 +760,77 @@ class RouteWakeViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun dismissArrival() {
         val context = getApplication<Application>()
+        // 1. Instantly silence all audio and vibration across the entire app
+        AlarmAudioEngine.stopAll()
+        VibrationEngine.stopAll(context)
+        testAudioEngine.stopAlarm()
+
+        // 2. Immediately cancel all notifications (tracking & arrival)
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        nm?.cancel(TrackingForegroundService.NOTIFICATION_ID)
+        nm?.cancel(ArrivalNotificationHelper.NOTIFICATION_ID_ARRIVAL)
+        nm?.cancelAll()
+        ArrivalNotificationHelper.dismissArrivalNotification(context)
+
+        // 3. Cancel WorkManager arrival detection
+        ArrivalWorkScheduler.cancelArrivalDetection(context)
+
+        // 4. Directly notify bound service if connected
+        trackingService?.dismissAlarm()
+
+        // 5. Send intent to service to ensure it handles termination even if unbound
         val intent = Intent(context, TrackingForegroundService::class.java).apply {
             action = TrackingForegroundService.ACTION_DISMISS_ALARM
         }
-        context.startService(intent)
+        try {
+            context.startService(intent)
+        } catch (_: Exception) {}
+
+        // 6. Transition tripState to COMPLETED so arrival dialog closes immediately
+        val currentDest = _selectedDestination.value
+        if (_completedTripSummary.value == null && currentDest != null) {
+            val dist = _metrics.value.initialDistanceMeters
+            _completedTripSummary.value = TripHistoryEntity(
+                destinationName = currentDest.name,
+                destinationAddress = currentDest.address,
+                destinationLat = currentDest.latitude,
+                destinationLng = currentDest.longitude,
+                startTimeMs = System.currentTimeMillis() - 60000,
+                endTimeMs = System.currentTimeMillis(),
+                distanceMeters = dist,
+                durationSeconds = 1L,
+                avgSpeedKmh = 0.0,
+                transportMode = _selectedTransport.value.name,
+                radiusMeters = _activeRadiusMeters.value,
+                completed = true
+            )
+        }
+        _tripState.value = TripState.COMPLETED
     }
 
     fun snoozeArrival() {
         val context = getApplication<Application>()
+        // 1. Immediately silence audio and vibration
+        AlarmAudioEngine.stopAll()
+        VibrationEngine.stopAll(context)
+        testAudioEngine.stopAlarm()
+
+        // 2. Cancel arrival notifications
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        nm?.cancel(TrackingForegroundService.NOTIFICATION_ID)
+        nm?.cancel(ArrivalNotificationHelper.NOTIFICATION_ID_ARRIVAL)
+        ArrivalNotificationHelper.dismissArrivalNotification(context)
+
+        // 3. Directly snooze in bound service
+        trackingService?.snoozeAlarm()
+
+        // 4. Send intent to service
         val intent = Intent(context, TrackingForegroundService::class.java).apply {
             action = TrackingForegroundService.ACTION_SNOOZE_ALARM
         }
-        context.startService(intent)
+        try {
+            context.startService(intent)
+        } catch (_: Exception) {}
     }
 
     fun clearCompletedSummary() {
@@ -614,6 +892,7 @@ class RouteWakeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun updateEcoMode(enabled: Boolean) = userPreferences.updateEcoMode(enabled)
+    fun updateWorkManagerBackground(enabled: Boolean) = userPreferences.updateWorkManagerBackground(enabled)
     fun updateAlarmTone(tone: AlarmTone) = userPreferences.updateAlarmTone(tone)
     fun updateVibration(enabled: Boolean) = userPreferences.updateVibration(enabled)
     fun updateDefaultRadius(radius: Int) = userPreferences.updateDefaultRadius(radius)
@@ -648,6 +927,7 @@ class RouteWakeViewModel(application: Application) : AndroidViewModel(applicatio
     override fun onCleared() {
         super.onCleared()
         testAudioEngine.stopAlarm()
+        compassSensorManager.stop()
         if (_tripState.value == TripState.IDLE) {
             gpsEngine.stopTracking()
         }

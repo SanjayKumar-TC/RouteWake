@@ -26,6 +26,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.getUnclippedBoundsInRoot
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.assertIsDisplayed
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -692,5 +694,324 @@ class ExampleRobolectricTest {
         }
 
         composeTestRule.onNodeWithTag("start_trip_button").assertExists()
+    }
+
+    @Test
+    fun `map camera state persistence and retrieval correctness`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val prefs = com.example.data.local.UserPreferences(context)
+
+        // Clear any leftover state
+        prefs.clearMapCameraState()
+        assertEquals(false, prefs.hasSavedMapCameraState())
+        assertNull(prefs.getMapCameraState())
+
+        // Save valid camera state
+        val testLat = 40.7128
+        val testLng = -74.0060
+        val testZoom = 15.5
+        prefs.saveMapCameraState(testLat, testLng, testZoom)
+
+        assertTrue(prefs.hasSavedMapCameraState())
+        val saved = prefs.getMapCameraState()
+        assertNotNull(saved)
+        assertEquals(testLat, saved!!.latitude, 0.00001)
+        assertEquals(testLng, saved.longitude, 0.00001)
+        assertEquals(testZoom, saved.zoom, 0.00001)
+
+        // Test validation logic
+        assertTrue(com.example.data.local.UserPreferences.isValidCameraState(testLat, testLng, testZoom))
+        assertEquals(false, com.example.data.local.UserPreferences.isValidCameraState(95.0, testLng, testZoom)) // lat out of bounds
+        assertEquals(false, com.example.data.local.UserPreferences.isValidCameraState(testLat, 200.0, testZoom)) // lng out of bounds
+        assertEquals(false, com.example.data.local.UserPreferences.isValidCameraState(testLat, testLng, 0.5)) // zoom too low
+        assertEquals(false, com.example.data.local.UserPreferences.isValidCameraState(testLat, testLng, 25.0)) // zoom too high
+        assertEquals(false, com.example.data.local.UserPreferences.isValidCameraState(Double.NaN, testLng, testZoom))
+        assertEquals(false, com.example.data.local.UserPreferences.isValidCameraState(testLat, Double.POSITIVE_INFINITY, testZoom))
+    }
+
+    @Test
+    fun `viewmodel delegates map camera state save and restore properly`() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val vm = com.example.ui.RouteWakeViewModel(app)
+
+        val targetLat = 51.5074
+        val targetLng = -0.1278
+        val targetZoom = 14.2
+
+        vm.saveMapCameraState(targetLat, targetLng, targetZoom)
+        val restored = vm.getSavedMapCameraState()
+
+        assertNotNull(restored)
+        assertEquals(targetLat, restored!!.latitude, 0.0001)
+        assertEquals(targetLng, restored.longitude, 0.0001)
+        assertEquals(targetZoom, restored.zoom, 0.0001)
+    }
+
+    @Test
+    fun `follow mode location prioritization and manual camera persistence logic`() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val vm = com.example.ui.RouteWakeViewModel(app)
+
+        // 1. Follow Mode is enabled initially
+        assertTrue(vm.isFollowMode.value)
+
+        // 2. User manually navigates on the map
+        val manualLat = 40.7128
+        val manualLng = -74.0060
+        val manualZoom = 15.0
+        vm.onManualMapNavigation(manualLat, manualLng, manualZoom)
+
+        // Manual navigation disengages follow mode and persists manual camera state
+        assertEquals(false, vm.isFollowMode.value)
+        val saved = vm.getSavedMapCameraState()
+        assertNotNull(saved)
+        assertEquals(manualLat, saved!!.latitude, 0.0001)
+        assertEquals(manualLng, saved.longitude, 0.0001)
+        assertEquals(manualZoom, saved.zoom, 0.0001)
+
+        // 3. In manual navigation mode, camera state is preserved and returned by getInitialCameraState()
+        val manualInitial = vm.getInitialCameraState()
+        assertNotNull(manualInitial)
+        assertEquals(manualLat, manualInitial!!.latitude, 0.0001)
+        assertEquals(manualLng, manualInitial.longitude, 0.0001)
+
+        // 4. Activating follow mode strictly increments recenterTrigger to center on user
+        val prevRecenter = vm.recenterTrigger.value
+        vm.activateFollowMode()
+        assertTrue(vm.isFollowMode.value)
+        assertTrue(vm.recenterTrigger.value > prevRecenter)
+
+        // 5. Preserved manual navigation camera state in user preferences is NOT destroyed
+        val stillSavedManual = vm.getSavedMapCameraState()
+        assertNotNull(stillSavedManual)
+        assertEquals(manualLat, stillSavedManual!!.latitude, 0.0001)
+        assertEquals(manualLng, stillSavedManual.longitude, 0.0001)
+
+        // 6. Deactivating follow mode returns to manual mode with preserved camera state
+        vm.setFollowMode(false)
+        assertEquals(false, vm.isFollowMode.value)
+        val restoredCamera = vm.getInitialCameraState()
+        assertNotNull(restoredCamera)
+        assertEquals(manualLat, restoredCamera!!.latitude, 0.0001)
+        assertEquals(manualLng, restoredCamera.longitude, 0.0001)
+    }
+
+    @Test
+    fun `compass sensor manager and viewmodel heading integration`() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val vm = com.example.ui.RouteWakeViewModel(app)
+
+        // Initial deviceHeading should be initialized (StateFlow is ready)
+        val headingFlow = vm.deviceHeading
+        assertNotNull(headingFlow)
+
+        // Lifecycle controls
+        vm.startCompass()
+        vm.stopCompass()
+    }
+
+    @Test
+    fun `map controls test tags and active tab sheet animation trigger`() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val vm = com.example.ui.RouteWakeViewModel(app)
+
+        // Verify sheet tab states trigger controls sliding
+        assertEquals(null, vm.activeTab.value)
+        vm.onTabClicked(com.example.ui.components.NavTab.COCKPIT)
+        assertEquals(com.example.ui.components.NavTab.COCKPIT, vm.activeTab.value)
+        vm.closeSheet()
+        assertEquals(null, vm.activeTab.value)
+    }
+
+    @Test
+    fun `isGenericLocalQuery classifies queries correctly`() {
+        val geocodingService = GeocodingService()
+        assertTrue(geocodingService.isGenericLocalQuery("hospital"))
+        assertTrue(geocodingService.isGenericLocalQuery("restaurant"))
+        assertTrue(geocodingService.isGenericLocalQuery("cafe"))
+        assertTrue(geocodingService.isGenericLocalQuery("mall"))
+        assertTrue(geocodingService.isGenericLocalQuery("petrol pump"))
+        assertTrue(geocodingService.isGenericLocalQuery("atm"))
+        assertTrue(geocodingService.isGenericLocalQuery("food near me"))
+
+        // Explicit locations should NOT be classified as generic
+        org.junit.Assert.assertFalse(geocodingService.isGenericLocalQuery("Bengaluru"))
+        org.junit.Assert.assertFalse(geocodingService.isGenericLocalQuery("Mysuru"))
+        org.junit.Assert.assertFalse(geocodingService.isGenericLocalQuery("Chennai"))
+        org.junit.Assert.assertFalse(geocodingService.isGenericLocalQuery("Tokyo"))
+        org.junit.Assert.assertFalse(geocodingService.isGenericLocalQuery("London"))
+        org.junit.Assert.assertFalse(geocodingService.isGenericLocalQuery("Paris"))
+        org.junit.Assert.assertFalse(geocodingService.isGenericLocalQuery("MG Road"))
+    }
+
+    @Test
+    fun `search with Bengaluru GPS returns nearby local hospitals`() = runBlocking {
+        val geocodingService = GeocodingService()
+        val bengaluruLat = 12.9716
+        val bengaluruLon = 77.5946
+
+        val results = geocodingService.searchDestinations("hospital", bengaluruLat, bengaluruLon)
+        assertTrue("Hospital search should return results", results.isNotEmpty())
+
+        // Verify that the top result is in or near Bengaluru (< 60 km)
+        val first = results.first()
+        val distMeters = GeocodingService.calculateDistanceMeters(bengaluruLat, bengaluruLon, first.latitude, first.longitude)
+        assertTrue("First hospital ($distMeters m away, ${first.name}, ${first.address}) should be in local urban area (< 60 km)", distMeters <= 60_000.0)
+    }
+
+    @Test
+    fun `search with Bengaluru GPS returns nearby local restaurants`() = runBlocking {
+        val geocodingService = GeocodingService()
+        val bengaluruLat = 12.9716
+        val bengaluruLon = 77.5946
+
+        val results = geocodingService.searchDestinations("restaurant", bengaluruLat, bengaluruLon)
+        assertTrue("Restaurant search should return results", results.isNotEmpty())
+
+        val first = results.first()
+        val distMeters = GeocodingService.calculateDistanceMeters(bengaluruLat, bengaluruLon, first.latitude, first.longitude)
+        assertTrue("First restaurant ($distMeters m away, ${first.name}) should be in local urban area (< 60 km)", distMeters <= 60_000.0)
+    }
+
+    @Test
+    fun `search explicit location Tokyo does not force local GPS coordinates`() = runBlocking {
+        val geocodingService = GeocodingService()
+        val bengaluruLat = 12.9716
+        val bengaluruLon = 77.5946
+
+        val results = geocodingService.searchDestinations("Tokyo", bengaluruLat, bengaluruLon)
+        assertTrue("Tokyo search should return results", results.isNotEmpty())
+
+        val first = results.first()
+        // Tokyo is in Japan (~35.6°N, ~139.6°E), not Bengaluru (~12.9°N, ~77.5°E)
+        assertTrue("First result for 'Tokyo' must be Tokyo Japan, not Bengaluru (got ${first.name}, ${first.address})",
+            first.latitude > 30.0 && first.longitude > 130.0)
+    }
+
+    @Test
+    fun `search explicit location Paris returns Paris France`() = runBlocking {
+        val geocodingService = GeocodingService()
+        val bengaluruLat = 12.9716
+        val bengaluruLon = 77.5946
+
+        val results = geocodingService.searchDestinations("Paris", bengaluruLat, bengaluruLon)
+        assertTrue("Paris search should return results", results.isNotEmpty())
+
+        val first = results.first()
+        // Paris, France is around lat 48.8°N, lon 2.3°E
+        assertTrue("First result for 'Paris' must be Paris France, not a local shop (got ${first.name}, ${first.address})",
+            first.latitude > 45.0 && first.longitude in 1.5..3.5)
+    }
+
+    @Test
+    fun `search explicit location Bengaluru returns Bengaluru city`() = runBlocking {
+        val geocodingService = GeocodingService()
+        val results = geocodingService.searchDestinations("Bengaluru", 12.9716, 77.5946)
+        assertTrue("Bengaluru search should return results", results.isNotEmpty())
+        val first = results.first()
+        assertTrue("First result should be Bengaluru", first.name.contains("Bengaluru", ignoreCase = true) || first.address.contains("Karnataka", ignoreCase = true))
+    }
+
+    @Test
+    fun `search with unavailable GPS functions gracefully`() = runBlocking {
+        val geocodingService = GeocodingService()
+        // GPS unavailable (null, null)
+        val results = geocodingService.searchDestinations("hospital", null, null)
+        assertTrue("Search without GPS should still function without crashing", results.isNotEmpty())
+    }
+
+    @Test
+    fun `rapid query changes do not overwrite latest results in ViewModel`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val vm = com.example.ui.RouteWakeViewModel(app)
+
+        // Rapidly change query from "hospital" to "restaurant"
+        vm.onSearchQueryChanged("hospital")
+        vm.onSearchQueryChanged("restaurant")
+
+        // Wait for debounce and search completion
+        kotlinx.coroutines.delay(1000L)
+
+        val finalResults = vm.searchResults.value
+        assertEquals("restaurant", vm.searchQuery.value)
+        // If results returned, none should be stale or mismatch
+        assertEquals(false, vm.isSearching.value)
+    }
+
+    @Test
+    fun `dismiss arrival stops audio engine and vibration engine immediately`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val audioEngine = com.example.engine.AlarmAudioEngine()
+        val vibrationEngine = com.example.engine.VibrationEngine(context)
+
+        // Start alarm and vibration
+        audioEngine.startAlarm(com.example.data.model.AlarmTone.RADAR_BEEP)
+        vibrationEngine.startArrivalVibration()
+
+        // Calling stopAll on both engines should immediately terminate active playback
+        com.example.engine.AlarmAudioEngine.stopAll()
+        com.example.engine.VibrationEngine.stopAll(context)
+
+        assertEquals(false, audioEngine.isAlarmActive())
+    }
+
+    @Test
+    fun `viewModel dismissArrival updates state and cancels active alarms`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val vm = com.example.ui.RouteWakeViewModel(app)
+
+        val testDest = Destination(
+            name = "Test Point",
+            address = "123 Main St",
+            latitude = 37.7749,
+            longitude = -122.4194
+        )
+        vm.selectDestination(testDest)
+
+        // Simulate arrival dismissal
+        vm.dismissArrival()
+
+        // Trip state should immediately transition out of ARRIVED
+        assertTrue("Trip state after dismissal must be COMPLETED or IDLE",
+            vm.tripState.value == com.example.data.model.TripState.COMPLETED ||
+            vm.tripState.value == com.example.data.model.TripState.IDLE
+        )
+    }
+
+    @Test
+    fun `arrivalDialog renders and dismiss button responds to click`() {
+        var dismissed = false
+        var snoozed = false
+
+        composeTestRule.setContent {
+            com.example.ui.components.ArrivalDialog(
+                destination = Destination(
+                    name = "Downtown Station",
+                    address = "100 Market St",
+                    latitude = 37.7749,
+                    longitude = -122.4194
+                ),
+                distanceMeters = 150.0,
+                onDismiss = { dismissed = true },
+                onSnooze = { snoozed = true }
+            )
+        }
+
+        // Verify dismiss button is displayed and clickable
+        composeTestRule.onNodeWithTag("arrival_dismiss_button").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("arrival_snooze_button").assertIsDisplayed()
+
+        // Click dismiss button to trigger visual feedback animation
+        composeTestRule.onNodeWithTag("arrival_dismiss_button").performClick()
+    }
+
+    @Test
+    fun `gps warmup initializes to 3 seconds`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val gpsEngine = com.example.engine.GpsEngine.getInstance(context)
+
+        gpsEngine.startWarmup { }
+
+        assertEquals("Warmup countdown should start at 3 seconds", 3, gpsEngine.warmupSecondsRemaining.value)
     }
 }

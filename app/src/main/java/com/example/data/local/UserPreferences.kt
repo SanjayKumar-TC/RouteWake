@@ -20,7 +20,8 @@ data class AppSettings(
     val defaultTransport: TransportMode = TransportMode.CAR,
     val isSimulationActive: Boolean = false,
     val simulationSpeedMode: String = "CAR_30X",
-    val trafficEnabled: Boolean = true
+    val trafficEnabled: Boolean = true,
+    val workManagerBackgroundEnabled: Boolean = true
 )
 
 class UserPreferences(context: Context) {
@@ -44,8 +45,14 @@ class UserPreferences(context: Context) {
             defaultTransport = TransportMode.fromString(prefs.getString(KEY_DEFAULT_TRANSPORT, TransportMode.CAR.name) ?: TransportMode.CAR.name),
             isSimulationActive = prefs.getBoolean(KEY_SIM_ACTIVE, false),
             simulationSpeedMode = prefs.getString(KEY_SIM_SPEED, "CAR_30X") ?: "CAR_30X",
-            trafficEnabled = prefs.getBoolean(KEY_TRAFFIC_ENABLED, true)
+            trafficEnabled = prefs.getBoolean(KEY_TRAFFIC_ENABLED, true),
+            workManagerBackgroundEnabled = prefs.getBoolean(KEY_WORKMANAGER_BACKGROUND, true)
         )
+    }
+
+    fun updateWorkManagerBackground(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_WORKMANAGER_BACKGROUND, enabled).apply()
+        _settingsFlow.value = _settingsFlow.value.copy(workManagerBackgroundEnabled = enabled)
     }
 
     fun updateTrafficEnabled(enabled: Boolean) {
@@ -157,6 +164,52 @@ class UserPreferences(context: Context) {
 
     fun hasActiveTrip(): Boolean = prefs.getBoolean(KEY_ACTIVE_TRIP_RUNNING, false)
 
+    fun saveMapCameraState(latitude: Double, longitude: Double, zoom: Double) {
+        if (!isValidCameraState(latitude, longitude, zoom)) return
+        prefs.edit()
+            .putLong(KEY_LAST_MAP_LATITUDE, java.lang.Double.doubleToRawLongBits(latitude))
+            .putLong(KEY_LAST_MAP_LONGITUDE, java.lang.Double.doubleToRawLongBits(longitude))
+            .putLong(KEY_LAST_MAP_ZOOM, java.lang.Double.doubleToRawLongBits(zoom))
+            .putBoolean(KEY_HAS_SAVED_MAP_CAMERA, true)
+            .apply()
+    }
+
+    fun saveMapCameraStateSynchronous(latitude: Double, longitude: Double, zoom: Double) {
+        if (!isValidCameraState(latitude, longitude, zoom)) return
+        prefs.edit()
+            .putLong(KEY_LAST_MAP_LATITUDE, java.lang.Double.doubleToRawLongBits(latitude))
+            .putLong(KEY_LAST_MAP_LONGITUDE, java.lang.Double.doubleToRawLongBits(longitude))
+            .putLong(KEY_LAST_MAP_ZOOM, java.lang.Double.doubleToRawLongBits(zoom))
+            .putBoolean(KEY_HAS_SAVED_MAP_CAMERA, true)
+            .commit()
+    }
+
+    fun getMapCameraState(): MapCameraState? {
+        if (!prefs.getBoolean(KEY_HAS_SAVED_MAP_CAMERA, false)) return null
+        if (!prefs.contains(KEY_LAST_MAP_LATITUDE) || !prefs.contains(KEY_LAST_MAP_LONGITUDE) || !prefs.contains(KEY_LAST_MAP_ZOOM)) {
+            return null
+        }
+        val lat = java.lang.Double.longBitsToDouble(prefs.getLong(KEY_LAST_MAP_LATITUDE, 0L))
+        val lng = java.lang.Double.longBitsToDouble(prefs.getLong(KEY_LAST_MAP_LONGITUDE, 0L))
+        val zoom = java.lang.Double.longBitsToDouble(prefs.getLong(KEY_LAST_MAP_ZOOM, 0L))
+        return if (isValidCameraState(lat, lng, zoom)) {
+            MapCameraState(lat, lng, zoom)
+        } else {
+            null
+        }
+    }
+
+    fun hasSavedMapCameraState(): Boolean = getMapCameraState() != null
+
+    fun clearMapCameraState() {
+        prefs.edit()
+            .remove(KEY_LAST_MAP_LATITUDE)
+            .remove(KEY_LAST_MAP_LONGITUDE)
+            .remove(KEY_LAST_MAP_ZOOM)
+            .putBoolean(KEY_HAS_SAVED_MAP_CAMERA, false)
+            .apply()
+    }
+
     companion object {
         private const val KEY_ECO_MODE = "pref_eco_mode"
         private const val KEY_ALARM_TONE = "pref_alarm_tone"
@@ -170,6 +223,7 @@ class UserPreferences(context: Context) {
         private const val KEY_SIM_SPEED = "pref_sim_speed"
         private const val KEY_RECENT_SEARCHES = "pref_recent_searches"
         private const val KEY_TRAFFIC_ENABLED = "pref_traffic_enabled"
+        private const val KEY_WORKMANAGER_BACKGROUND = "pref_workmanager_background"
 
         private const val KEY_ACTIVE_TRIP_RUNNING = "pref_active_trip_running"
         private const val KEY_ACTIVE_TRIP_NAME = "pref_active_trip_name"
@@ -179,8 +233,30 @@ class UserPreferences(context: Context) {
         private const val KEY_ACTIVE_TRIP_RADIUS = "pref_active_trip_radius"
         private const val KEY_ACTIVE_TRIP_TRANSPORT = "pref_active_trip_transport"
         private const val KEY_ACTIVE_TRIP_START_TIME = "pref_active_trip_start_time"
+
+        private const val KEY_LAST_MAP_LATITUDE = "pref_last_map_latitude"
+        private const val KEY_LAST_MAP_LONGITUDE = "pref_last_map_longitude"
+        private const val KEY_LAST_MAP_ZOOM = "pref_last_map_zoom"
+        private const val KEY_HAS_SAVED_MAP_CAMERA = "pref_has_saved_map_camera"
+
+        fun isValidCameraState(lat: Double, lng: Double, zoom: Double): Boolean {
+            if (lat.isNaN() || lat.isInfinite() || lng.isNaN() || lng.isInfinite() || zoom.isNaN() || zoom.isInfinite()) {
+                return false
+            }
+            if (lat < -85.05112878 || lat > 85.05112878) return false
+            if (lng < -180.0 || lng > 180.0) return false
+            if (zoom < 2.0 || zoom > 22.0) return false
+            if (lat == 0.0 && lng == 0.0) return false
+            return true
+        }
     }
 }
+
+data class MapCameraState(
+    val latitude: Double,
+    val longitude: Double,
+    val zoom: Double
+)
 
 data class ActiveTripRecord(
     val destinationName: String,

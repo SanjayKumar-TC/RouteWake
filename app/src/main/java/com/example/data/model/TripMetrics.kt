@@ -9,7 +9,7 @@ data class TripMetrics(
     val progressPercent: Float = 0f,
     val currentSpeedKmh: Double = 0.0,
     val isModeledEta: Boolean = true,
-    val warmupSecondsRemaining: Int = 10,
+    val warmupSecondsRemaining: Int = 3,
     val gpsQuality: GpsQuality = GpsQuality.GOOD
 )
 
